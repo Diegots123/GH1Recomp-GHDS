@@ -78,6 +78,10 @@ namespace gh2
             runtime.replaceFunction(address, &run);
         }
 
+        // The function replaced, for an answer that runs it first
+        // (through PS2Runtime::callGuestFunction).
+        static PS2Runtime::RecompiledFunction original() { return s_original; }
+
     private:
         static void run(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {

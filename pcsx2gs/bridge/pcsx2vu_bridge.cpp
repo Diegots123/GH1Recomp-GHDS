@@ -1,5 +1,13 @@
 #include "pcsx2vu_bridge.h"
 
+#include <atomic>
+#include <chrono>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+
 #include "Common.h"
 #include "Config.h"
 #include "VU.h"
@@ -70,7 +78,62 @@ namespace pcsx2vu
         return near ? near + (code ? 0x4000 : 0) : nullptr;
     }
 
+    namespace
+    {
+        // Timed in TSC ticks (a thousand programs a frame: the clock call
+        // itself was costing more than many of them), turned into time
+        // with a rate measured against the steady clock as the game runs.
+        std::atomic<uint32_t> s_runs{0};
+        std::atomic<uint64_t> s_runTicks{0};
+        std::atomic<uint64_t> s_longestTicks{0};
+        std::atomic<uint32_t> s_slowRuns{0};
+        std::atomic<uint32_t> s_clears{0};
+        uint64_t s_calibTicks = 0;
+        std::chrono::steady_clock::time_point s_calibTime;
+        double s_nsPerTick = 0.0;
+    }
+
+    Timing takeTiming()
+    {
+        const uint64_t ticks = __rdtsc();
+        const auto now = std::chrono::steady_clock::now();
+        if (s_calibTicks == 0)
+        {
+            s_calibTicks = ticks;
+            s_calibTime = now;
+        }
+        else if (s_nsPerTick == 0.0 && now - s_calibTime >= std::chrono::milliseconds(500) && ticks > s_calibTicks)
+        {
+            s_nsPerTick = std::chrono::duration<double, std::nano>(now - s_calibTime).count() /
+                          static_cast<double>(ticks - s_calibTicks);
+        }
+        Timing t;
+        t.runs = s_runs.exchange(0);
+        t.totalNs = static_cast<uint64_t>(static_cast<double>(s_runTicks.exchange(0)) * s_nsPerTick);
+        t.longestNs = static_cast<uint64_t>(static_cast<double>(s_longestTicks.exchange(0)) * s_nsPerTick);
+        t.slowRuns = s_slowRuns.exchange(0);
+        t.clears = s_clears.exchange(0);
+        return t;
+    }
+
+    static Result runProgram(const Run &r);
+
     Result run(const Run &r)
+    {
+        const uint64_t t0 = __rdtsc();
+        const Result result = runProgram(r);
+        const uint64_t ticks = __rdtsc() - t0;
+        // The EE's thread runs VU1 and takes the timing: plain increments.
+        s_runs.store(s_runs.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
+        s_runTicks.store(s_runTicks.load(std::memory_order_relaxed) + ticks, std::memory_order_relaxed);
+        if (ticks > s_longestTicks.load(std::memory_order_relaxed))
+            s_longestTicks.store(ticks, std::memory_order_relaxed);
+        if (s_nsPerTick > 0.0 && static_cast<double>(ticks) * s_nsPerTick > 1e6)
+            s_slowRuns.store(s_slowRuns.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
+        return result;
+    }
+
+    static Result runProgram(const Run &r)
     {
         Result result;
         if (!r.code || !r.data)
@@ -85,6 +148,7 @@ namespace pcsx2vu
             // As PCSX2 does after VIF MPG: the next start looks the program up again.
             CpuMicroVU1.Clear(0, 0x4000);
             s_generation = r.codeGeneration;
+            s_clears.store(s_clears.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
         }
 
         vif1Regs.top = r.top & 0x3ff;

@@ -1,17 +1,20 @@
 #include "runtime/host_hooks.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ee_video_timing.h"
 #include "runtime/host_clock.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 namespace
 {
@@ -185,6 +188,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
     const std::chrono::nanoseconds period(m_vblankPeriodNs.load(std::memory_order_relaxed));
+    ps2x::setVBlankCycles(nanosecondsToEeCycles(period.count()));
     scheduleEvent(m_eeCycle + nanosecondsToEeCycles(period.count()),
                   ps2x::host_clock::now() + period,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
@@ -1392,8 +1396,9 @@ void EeScheduler::setVBlankPeriod(std::chrono::nanoseconds period) noexcept
 {
     // VBlankEnd follows VBlankStart by kVBlankDuration, so a period must
     // leave room for it.
-    m_vblankPeriodNs.store(std::max<int64_t>(period.count(), 2 * std::chrono::nanoseconds(kVBlankDuration).count()),
-                           std::memory_order_relaxed);
+    const int64_t ns = std::max<int64_t>(period.count(), 2 * std::chrono::nanoseconds(kVBlankDuration).count());
+    m_vblankPeriodNs.store(ns, std::memory_order_relaxed);
+    ps2x::setVBlankCycles(nanosecondsToEeCycles(static_cast<uint64_t>(ns)));
 }
 
 void EeScheduler::dropHostTime(std::chrono::nanoseconds elapsed)
@@ -1885,6 +1890,30 @@ void EeScheduler::processPendingEvents()
     applyPendingPreemption();
 }
 
+namespace
+{
+    std::atomic<uint64_t> s_pacingIdleNs{0};
+
+    // Time the EE spends waiting (for a paced deadline, or with every guest
+    // thread blocked until the next event), for the host's frame stats.
+    struct IdleTime
+    {
+        std::chrono::steady_clock::time_point from = ps2x::host_clock::Clock::now();
+        ~IdleTime()
+        {
+            s_pacingIdleNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                               ps2x::host_clock::Clock::now() - from)
+                                                               .count()),
+                                     std::memory_order_relaxed);
+        }
+    };
+}
+
+uint64_t ps2x::takePacingIdleNs() noexcept
+{
+    return s_pacingIdleNs.exchange(0, std::memory_order_relaxed);
+}
+
 void EeScheduler::processDueDeadlines()
 {
     for (;;)
@@ -1912,10 +1941,28 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
-                m_eventCv.wait_until(lock, ps2x::host_clock::real(pacingDeadline), [this]()
-                                     { return !m_events.empty() ||
-                                              m_stopRequested.load(std::memory_order_acquire); });
-                if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+                IdleTime idle;
+                // Asleep until shortly before the deadline, then yielding up
+                // to it: a sleep alone wakes as late as the system's timer
+                // allows (a millisecond or two on Windows), and VBlanks that
+                // wander by that much are pictures shown unevenly.
+                constexpr auto kYieldWindow = std::chrono::microseconds(1500);
+                const auto target = ps2x::host_clock::real(pacingDeadline);
+                auto interrupted = [this]()
+                { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); };
+                if (target - ps2x::host_clock::Clock::now() > kYieldWindow)
+                    m_eventCv.wait_until(lock, target - kYieldWindow, interrupted);
+                if (!interrupted() && ps2x::host_clock::Clock::now() < target)
+                {
+                    // Without the lock: other threads post their events
+                    // meanwhile, and they are seen right after.
+                    lock.unlock();
+                    while (ps2x::host_clock::Clock::now() < target &&
+                           !m_stopRequested.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    lock.lock();
+                }
+                if (interrupted())
                 {
                     updateNextDeadline();
                     return;
@@ -2130,6 +2177,7 @@ void EeScheduler::waitForEvent()
     }
     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
+    IdleTime idle;
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
         m_eventCv.wait(lock, [this]()

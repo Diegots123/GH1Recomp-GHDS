@@ -530,7 +530,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         pos += 4;
 
         uint8_t opcode = (cmd >> 24) & 0x7F;
-        g_ps2xTraceVif1Ops[opcode].fetch_add(1, std::memory_order_relaxed);
+        // A debug count (the software GS's trace): a plain increment, not a
+        // locked one on every VIF command.
+        g_ps2xTraceVif1Ops[opcode].store(g_ps2xTraceVif1Ops[opcode].load(std::memory_order_relaxed) + 1u,
+                                         std::memory_order_relaxed);
         {
             // PS2X_VIF1_LOG=<to tick>: every non-UNPACK VIF1 command until then.
             static const long long logTo = [] {
@@ -821,16 +824,105 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
-                uint32_t srcIndex = 0u;
-                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                // Unmasked, with no row addition (MODE 0 or 3): the formats
+                // GH1 sends nearly all its geometry in (V4-32, V3-32, V2-32,
+                // V4-16) are written straight, as the generic path below
+                // would write them.
+                const uint32_t unpackMode = vif1_regs.mode & 3u;
+                const bool direct = !maskEnable && unpackMode != 1u && unpackMode != 2u;
+                const int directKind = !direct                ? 0
+                                       : (vl == 0u && vn == 3u) ? 1
+                                       : (vl == 0u && vn == 2u) ? 2
+                                       : (vl == 0u && vn == 1u) ? 3
+                                       : (vl == 1u && vn == 3u) ? 4
+                                                                : 0;
+                // PS2X_VIF_VERIFY=1: each straight write checked against the
+                // generic path's.
+                static const bool verifyDirect = [] {
+                    const char *v = std::getenv("PS2X_VIF_VERIFY");
+                    return v && v[0] == '1';
+                }();
+                // With CL >= WL every vector has its source, and it lands in
+                // VU1 memory (addresses wrap at 1024 quadwords): the straight
+                // formats go in a tight loop each. (Checked against the
+                // generic path too, under PS2X_VIF_VERIFY=1.)
+                std::vector<uint8_t> verifyCopy;
+                bool tightDone = false;
+                if (directKind != 0 && cl >= wl)
                 {
-                    const uint32_t cyclePos = writeIndex % wl;
+                    uint8_t *mem = m_vu1Data;
+                    if (verifyDirect)
+                    {
+                        verifyCopy.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                        mem = verifyCopy.data();
+                    }
+                    const uint8_t *src = srcBase;
+                    const uint8_t *const end = data + sizeBytes;
+                    uint32_t cyc = 0u;
+                    uint32_t blk = 0u;
+                    auto dest = [&]() { return mem + (((vuAddr + blk * cl + cyc) & 0x3FFu) << 4u); };
+                    auto advance = [&]()
+                    {
+                        src += bytesPerVector;
+                        if (++cyc == wl)
+                        {
+                            cyc = 0u;
+                            ++blk;
+                        }
+                    };
+                    switch (directKind)
+                    {
+                    case 1: // V4-32
+                        for (uint32_t i = 0; i < writeVectorCount; ++i, advance())
+                            std::memcpy(dest(), src, 16u);
+                        break;
+                    case 2: // V3-32
+                        for (uint32_t i = 0; i < writeVectorCount; ++i, advance())
+                        {
+                            uint8_t *d = dest();
+                            std::memcpy(d, src, 12u);
+                            if (src + 16u <= end)
+                                std::memcpy(d + 12u, src + 12u, 4u);
+                        }
+                        break;
+                    case 3: // V2-32
+                        for (uint32_t i = 0; i < writeVectorCount; ++i, advance())
+                        {
+                            uint8_t *d = dest();
+                            std::memcpy(d, src, 8u);
+                            std::memcpy(d + 8u, src, 8u);
+                        }
+                        break;
+                    default: // V4-16
+                        for (uint32_t i = 0; i < writeVectorCount; ++i, advance())
+                        {
+                            uint16_t h[4];
+                            std::memcpy(h, src, sizeof(h));
+                            uint32_t out[4];
+                            for (int c = 0; c < 4; ++c)
+                                out[c] = zeroExtend ? static_cast<uint32_t>(h[c])
+                                                    : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h[c])));
+                            std::memcpy(dest(), out, sizeof(out));
+                        }
+                        break;
+                    }
+                    tightDone = !verifyDirect;
+                }
+
+                uint32_t srcIndex = 0u;
+                // The write cycle position and block, counted rather than
+                // divided out of writeIndex for every vector.
+                uint32_t cyclePos = 0u;
+                uint32_t block = 0u;
+                for (uint32_t writeIndex = 0; !tightDone && writeIndex < writeVectorCount;
+                     ++writeIndex, cyclePos = (cyclePos + 1u == wl) ? (++block, 0u) : cyclePos + 1u)
+                {
                     const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
 
                     uint32_t destVec = 0;
                     if (cl >= wl)
                     {
-                        destVec = (vuAddr + (writeIndex / wl) * cl + cyclePos) & 0x3FFu;
+                        destVec = (vuAddr + block * cl + cyclePos) & 0x3FFu;
                     }
                     else
                     {
@@ -856,6 +948,46 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         srcVec = srcBase + srcIndex * bytesPerVector;
                         ++srcIndex;
                         decoded = true;
+                    }
+                    uint8_t directOut[16];
+                    const bool verifyThis = verifyDirect && directKind != 0 && decoded;
+                    if (directKind != 0 && decoded)
+                    {
+                        uint8_t *dst = verifyThis ? directOut : m_vu1Data + destOff;
+                        if (verifyThis)
+                            std::memcpy(directOut, m_vu1Data + destOff, 16u);
+                        switch (directKind)
+                        {
+                        case 1: // V4-32
+                            std::memcpy(dst, srcVec, 16u);
+                            break;
+                        case 2: // V3-32: W is the next element in the stream, when there is one
+                            std::memcpy(dst, srcVec, 12u);
+                            if (srcVec + 16u <= data + sizeBytes)
+                                std::memcpy(dst + 12u, srcVec + 12u, 4u);
+                            break;
+                        case 3: // V2-32: x y x y
+                        {
+                            uint32_t xy[2];
+                            std::memcpy(xy, srcVec, sizeof(xy));
+                            const uint32_t out[4] = {xy[0], xy[1], xy[0], xy[1]};
+                            std::memcpy(dst, out, sizeof(out));
+                            break;
+                        }
+                        default: // V4-16
+                        {
+                            uint16_t h[4];
+                            std::memcpy(h, srcVec, sizeof(h));
+                            uint32_t out[4];
+                            for (int c = 0; c < 4; ++c)
+                                out[c] = zeroExtend ? static_cast<uint32_t>(h[c])
+                                                    : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h[c])));
+                            std::memcpy(dst, out, sizeof(out));
+                            break;
+                        }
+                        }
+                        if (!verifyThis)
+                            continue;
                     }
 
                     auto extend16 = [&](uint16_t raw) -> uint32_t
@@ -1053,6 +1185,20 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                    if (verifyThis && std::memcmp(m_vu1Data + destOff, directOut, 16u) != 0)
+                    {
+                        static int reported = 0;
+                        if (reported++ < 20)
+                            std::fprintf(stderr, "[vif1] straight unpack differs: kind %d vn %u vl %u cl %u wl %u\n",
+                                         directKind, static_cast<unsigned>(vn), static_cast<unsigned>(vl), cl, wl);
+                    }
+                }
+                if (!verifyCopy.empty() && std::memcmp(verifyCopy.data(), m_vu1Data, PS2_VU1_DATA_SIZE) != 0)
+                {
+                    static int reported = 0;
+                    if (reported++ < 20)
+                        std::fprintf(stderr, "[vif1] tight unpack differs: kind %d cl %u wl %u num %u\n", directKind, cl,
+                                     wl, writeVectorCount);
                 }
             }
             pos += totalBytes;

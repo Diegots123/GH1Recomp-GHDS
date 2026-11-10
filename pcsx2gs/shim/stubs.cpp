@@ -121,6 +121,18 @@ namespace Host
             pcsx2gs::host().releaseWindow();
     }
     void BeginPresentFrame() {}
+    // Fullscreen is SDL's borderless window, never a Direct3D exclusive mode,
+    // so the swap chain is always made windowed.
+    bool IsFullscreen()
+    {
+        return false;
+    }
+    void SetFullscreen(bool) {}
+    void RunOnCPUThread(std::function<void()> function, bool)
+    {
+        if (function)
+            function();
+    }
     void AddIconOSDMessage(std::string, const char *, const std::string_view message, float)
     {
         std::fprintf(stderr, "[pcsx2 gs] %.*s\n", static_cast<int>(message.size()), message.data());

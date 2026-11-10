@@ -28,11 +28,20 @@ public:
     public:
         virtual ~FrameSource() = default;
         virtual bool readFrame(uint32_t frame, uint8_t *dst) = 0;
+        // `count` frames in a row; one read where the source allows it.
+        virtual bool readFrames(uint32_t first, uint32_t count, uint8_t *dst)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+                if (!readFrame(first + i, dst + static_cast<size_t>(i) * frameSize))
+                    return false;
+            return true;
+        }
         uint32_t frameSize = 0;
         uint32_t frameCount = 0;
     };
 
     static std::unique_ptr<DiscImage> open(const std::filesystem::path &path, std::string &error);
+    ~DiscImage();
 
     bool readSectors(uint32_t lbn, uint32_t count, uint8_t *dst);
     // Bytes of a file's extent from offset; returns how many were read.
@@ -45,11 +54,26 @@ public:
 private:
     DiscImage(std::unique_ptr<FrameSource> frames, uint32_t dataOffset);
     bool readSectorLocked(uint32_t lbn, uint8_t *dst);
+    bool readSectorsLocked(uint32_t lbn, uint32_t count, uint8_t *dst);
 
     std::unique_ptr<FrameSource> m_frames;
     uint32_t m_dataOffset = 0;
     std::mutex m_mutex;
+    // Sectors read ahead of a sequential reader, on a thread of their own.
+    struct ReadAhead;
+    std::unique_ptr<ReadAhead> m_readAhead;
 };
+
+// Microseconds callers spent waiting in DiscImage::readSectors since the
+// last call (the disc reads a frame waited for), and how many of those
+// reads the read-ahead already had.
+struct DiscReadStats
+{
+    uint64_t waitedUs = 0;
+    uint32_t reads = 0;
+    uint32_t ahead = 0;
+};
+DiscReadStats ps2TakeDiscReadStats();
 
 // The image named by PS2Runtime::IoPaths::cdImage, opened on first use, or
 // null when none is configured or it cannot be opened.

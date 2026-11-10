@@ -75,6 +75,17 @@ def main():
             shutil.copy2(dll, stage / dll.name)
         for name in ("GH1Recomp.ini", "LEIA-ME.txt", "gamecontrollerdb.txt"):
             shutil.copy2(ROOT / "dist" / "windows" / name, stage / name)
+        # The list of shader programs GH1 draws with, made by playing it: a
+        # first run then prepares them all as it opens. Not in the public
+        # repository (it is made from the game); each player's own runs
+        # write theirs to cache\ anyway.
+        programs = ROOT / "dist" / "windows" / "gh1_programs.bin"
+        if programs.is_file():
+            shutil.copy2(programs, stage / programs.name)
+        # Windows line ends in the texts meant to be opened, however git checked them out.
+        for name in ("GH1Recomp.ini", "LEIA-ME.txt"):
+            text = stage / name
+            text.write_bytes(text.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
         (stage / "iso" / "COLOQUE-A-ISO-AQUI.txt").write_text(
             "Coloque aqui o .iso do seu Guitar Hero (USA), SLUS-21224 v1.00.\r\n"
             "Put your Guitar Hero (USA) disc image (SLUS-21224 v1.00) here.\r\n")

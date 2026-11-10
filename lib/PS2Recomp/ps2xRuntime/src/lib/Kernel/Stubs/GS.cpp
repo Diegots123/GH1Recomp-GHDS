@@ -668,59 +668,81 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    namespace
+    {
+        // libgraph's sceGsStoreImage, as sceGsSetDefStoreImage lays it out
+        // (0x70 bytes): four VIF codes, then a GIF tag and A+D pairs for
+        // BITBLTBUF (+0x20), TRXPOS (+0x30), TRXREG (+0x40), FINISH and
+        // TRXDIR. Games change fields in it between the two calls (GH1's
+        // lens flares read the Z buffer by setting SPSM to PSMZ16 at +0x20),
+        // so sceGsExecStoreImage sends what the packet holds.
+        constexpr uint32_t kStoreImageBitbltbuf = 0x20u;
+        constexpr uint32_t kStoreImageTrxpos = 0x30u;
+        constexpr uint32_t kStoreImageTrxreg = 0x40u;
+
+        // Bits a pixel takes in a local-to-host transfer.
+        uint32_t transferBits(uint32_t psm)
+        {
+            switch (psm & 0x3Fu)
+            {
+            case 0x00u: // PSMCT32
+            case 0x30u: // PSMZ32
+                return 32u;
+            case 0x01u: // PSMCT24
+            case 0x31u: // PSMZ24
+                return 24u;
+            case 0x02u: // PSMCT16
+            case 0x0Au: // PSMCT16S
+            case 0x32u: // PSMZ16
+            case 0x3Au: // PSMZ16S
+                return 16u;
+            case 0x13u: // PSMT8
+            case 0x1Bu: // PSMT8H
+                return 8u;
+            case 0x14u: // PSMT4
+            case 0x24u: // PSMT4HL
+            case 0x2Cu: // PSMT4HH
+                return 4u;
+            default:
+                return 32u;
+            }
+        }
+    }
+
     void sceGsExecStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t imgAddr = getRegU32(ctx, 4);
-        uint32_t dstAddr = getRegU32(ctx, 5);
+        const uint32_t imgAddr = getRegU32(ctx, 4);
+        const uint32_t dstAddr = getRegU32(ctx, 5);
 
-        GsImageMem img{};
-        if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img))
+        const uint8_t *img = getConstMemPtr(rdram, imgAddr);
+        if (!runtime || !runtime->syncCoreSubsystems() || !img)
         {
             setReturnS32(ctx, -1);
             return;
         }
+        uint64_t bitbltbuf = 0, trxpos = 0, trxreg = 0;
+        std::memcpy(&bitbltbuf, img + kStoreImageBitbltbuf, sizeof(bitbltbuf));
+        std::memcpy(&trxpos, img + kStoreImageTrxpos, sizeof(trxpos));
+        std::memcpy(&trxreg, img + kStoreImageTrxreg, sizeof(trxreg));
 
-        const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
-        if (rowBytes == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint32_t fbw = img.vram_width ? img.vram_width : std::max<uint32_t>(1, (img.width + 63) / 64);
-        const uint32_t totalImageBytes = rowBytes * static_cast<uint32_t>(img.height);
-
+        const uint32_t spsm = static_cast<uint32_t>(bitbltbuf >> 24) & 0x3Fu;
+        const uint32_t width = static_cast<uint32_t>(trxreg) & 0xFFFu;
+        const uint32_t height = static_cast<uint32_t>(trxreg >> 32) & 0xFFFu;
+        const uint32_t totalImageBytes =
+            static_cast<uint32_t>((static_cast<uint64_t>(width) * height * transferBits(spsm) + 7u) / 8u);
         uint8_t *dst = getMemPtr(rdram, dstAddr);
-        if (!dst)
+        if (!dst || totalImageBytes == 0u)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
-        uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
-                             (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
-                             (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
-                             (static_cast<uint64_t>(0u) << 32) |
-                             (static_cast<uint64_t>(1u) << 48) |
-                             (static_cast<uint64_t>(0u) << 56);
-        uint64_t trxpos = (static_cast<uint64_t>(img.x & 0x7FFu) << 0) |
-                          (static_cast<uint64_t>(img.y & 0x7FFu) << 16) |
-                          (static_cast<uint64_t>(0u) << 32) |
-                          (static_cast<uint64_t>(0u) << 48);
-        uint64_t trxreg = static_cast<uint64_t>(img.height) << 32 | static_cast<uint64_t>(img.width);
-
-        uint32_t pktAddr = runtime->guestMalloc(80u, 16u);
-        if (pktAddr == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint8_t *pkt = getMemPtr(rdram, pktAddr);
+        const uint32_t pktAddr = runtime->guestMalloc(80u, 16u);
+        uint8_t *pkt = pktAddr ? getMemPtr(rdram, pktAddr) : nullptr;
         if (!pkt)
         {
-            runtime->guestFree(pktAddr);
+            if (pktAddr)
+                runtime->guestFree(pktAddr);
             setReturnS32(ctx, -1);
             return;
         }
@@ -1127,9 +1149,40 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // sceGsSetDefStoreImage(sp, sbp, sbw, spsm, x, y, w, h): libgraph's own
+    // packet (see sceGsExecStoreImage), its arguments in a0-a3 and t0-t3.
+    // sbp is BITBLTBUF's SBP (word address / 64). Returns its size, 7 qwords.
     void sceGsSetDefStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        sceGsSetDefLoadImage(rdram, ctx, runtime);
+        (void)runtime;
+        const uint32_t spAddr = getRegU32(ctx, 4);
+        uint8_t *sp = getMemPtr(rdram, spAddr);
+        if (!sp)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        const auto arg = [&](int reg) { return static_cast<uint64_t>(static_cast<uint16_t>(getRegU32(ctx, reg))); };
+        const uint64_t sbp = arg(5) & 0x3FFFu, sbw = arg(6) & 0x3Fu, spsm = arg(7) & 0x3Fu;
+        const uint64_t x = arg(8) & 0x7FFu, y = arg(9) & 0x7FFu, w = arg(10) & 0xFFFu, h = arg(11) & 0xFFFu;
+
+        uint32_t vif[4] = {0u, 0x06008000u /* MSKPATH3 on */, 0x13000000u /* FLUSHA */, 0x50000006u /* DIRECT 6 */};
+        uint64_t q[12] = {};
+        q[0] = (5ull << 0) | (1ull << 15) | (1ull << 60); // NLOOP 5, EOP, one register
+        q[1] = 0xEull;                                    // A+D
+        q[2] = sbp | (sbw << 16) | (spsm << 24);          // BITBLTBUF
+        q[3] = 0x50ull;
+        q[4] = x | (y << 16);                             // TRXPOS
+        q[5] = 0x51ull;
+        q[6] = w | (h << 32);                             // TRXREG
+        q[7] = 0x52ull;
+        q[8] = 0ull;                                      // FINISH
+        q[9] = 0x61ull;
+        q[10] = 1ull;                                     // TRXDIR: local to host
+        q[11] = 0x53ull;
+        std::memcpy(sp, vif, sizeof(vif));
+        std::memcpy(sp + 0x10, q, sizeof(q));
+        setReturnS32(ctx, 7);
     }
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

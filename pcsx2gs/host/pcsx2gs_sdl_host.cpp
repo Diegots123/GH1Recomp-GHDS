@@ -1,19 +1,44 @@
 #include "pcsx2gs_sdl_host.h"
 
 #include "pcsx2gs_bridge.h"
+#if defined(GH1_PCSX2VU)
+#include "pcsx2vu_bridge.h"
+#endif
 #include "guitars.h"
 #include "keyboard_options.h"
 #include "runtime/gs/gs_null_backend.h"
 #include "runtime/gs/gs_packet_tap.h"
 #include "runtime/host_hooks.h"
+#include "runtime/ee_scheduler.h"
+#include "runtime/ee_video_timing.h"
+#include "runtime/vif1_worker.h"
+#include "runtime/ps2_disc_image.h"
 
 #include <SDL3/SDL.h>
+#if !defined(_WIN32)
+#include <cpuid.h>
+#include <sched.h>
+#endif
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <intrin.h>
+#include <psapi.h>
+#include <timeapi.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +60,82 @@ namespace pcsx2gs
         // The screen GH1 shows (GH1's side says so).
         std::atomic<Screen> s_screen{Screen::Other};
 
+        // The CPU's name as it gives it (x86's brand string).
+        std::string cpuName()
+        {
+            uint32_t regs[12] = {};
+#if defined(_MSC_VER)
+            int r[4];
+            __cpuid(r, static_cast<int>(0x80000000u));
+            if (static_cast<uint32_t>(r[0]) < 0x80000004u)
+                return "unknown";
+            for (uint32_t i = 0; i < 3; ++i)
+            {
+                __cpuid(r, static_cast<int>(0x80000002u + i));
+                std::memcpy(regs + i * 4, r, sizeof(r));
+            }
+#else
+            unsigned a, b, c, d;
+            if (!__get_cpuid(0x80000000u, &a, &b, &c, &d) || a < 0x80000004u)
+                return "unknown";
+            for (uint32_t i = 0; i < 3; ++i)
+            {
+                __get_cpuid(0x80000002u + i, &a, &b, &c, &d);
+                regs[i * 4] = a;
+                regs[i * 4 + 1] = b;
+                regs[i * 4 + 2] = c;
+                regs[i * 4 + 3] = d;
+            }
+#endif
+            std::string name(reinterpret_cast<const char *>(regs), sizeof(regs));
+            name.erase(name.find_last_not_of(std::string(" \0", 2)) + 1);
+            name.erase(0, name.find_first_not_of(' '));
+            return name.empty() ? "unknown" : name;
+        }
+
+        // The CPU threads this process may run on (its affinity, which a
+        // test of a weaker PC narrows).
+        unsigned availableThreads()
+        {
+#if defined(_WIN32)
+            DWORD_PTR process = 0, system = 0;
+            if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process)
+            {
+                unsigned n = 0;
+                for (DWORD_PTR m = process; m; m &= m - 1)
+                    ++n;
+                return n;
+            }
+#else
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (sched_getaffinity(0, sizeof(set), &set) == 0)
+                return static_cast<unsigned>(CPU_COUNT(&set));
+#endif
+            return static_cast<unsigned>(std::max(1, SDL_GetNumLogicalCPUCores()));
+        }
+
+        // The process's memory in use (its working set, or resident set), MB.
+        unsigned processMegabytes()
+        {
+#if defined(_WIN32)
+            PROCESS_MEMORY_COUNTERS pmc{};
+            pmc.cb = sizeof(pmc);
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                return static_cast<unsigned>(pmc.WorkingSetSize >> 20);
+            return 0;
+#else
+            unsigned long pages = 0, resident = 0;
+            if (FILE *f = std::fopen("/proc/self/statm", "r"))
+            {
+                if (std::fscanf(f, "%lu %lu", &pages, &resident) != 2)
+                    resident = 0;
+                std::fclose(f);
+            }
+            return static_cast<unsigned>((resident * 4096ull) >> 20);
+#endif
+        }
+
         // PS2 pad bits, active low (libpad order).
         constexpr uint16_t kSelect = 0x0001, kL3 = 0x0002, kR3 = 0x0004, kStart = 0x0008;
         constexpr uint16_t kUp = 0x0010, kRight = 0x0020, kDown = 0x0040, kLeft = 0x0080;
@@ -42,6 +143,25 @@ namespace pcsx2gs
         constexpr uint16_t kTriangle = 0x1000, kCircle = 0x2000, kCross = 0x4000, kSquare = 0x8000;
 
         constexpr uint32_t kPrivRegsSize = 0x2000;
+
+        // The EE's side of a frame, for the hitch log, after the registers in
+        // a VBlank record (microseconds): since the VBlank before, the wait
+        // for the GS at the one before, and the waits for VRAM reads.
+        struct EeTiming
+        {
+            uint32_t sinceLast;
+            uint32_t vblankWait;
+            uint32_t readWait;
+            uint32_t reads;
+            uint32_t vuRuns;    // VU1 programs run, their time, and the longest
+            uint32_t vuTotal;
+            uint32_t vuLongest;
+            uint32_t discWait;  // waiting on disc reads (the host's disk), microseconds, and how many
+            uint32_t idle;      // ahead of the clock with nothing to do, before this VBlank
+            uint32_t vifBusy;   // the VIF1 thread's work since the last VBlank (0 when it is off)
+            uint32_t vifWait;   // the EE waiting for the VIF1 thread to catch up (drain)
+        };
+        static_assert(sizeof(EeTiming) == 44);
         constexpr uint32_t kFramesAhead = 2; // vsyncs the EE may queue before it waits, as PCSX2
 
         enum RecordType : uint32_t
@@ -49,6 +169,7 @@ namespace pcsx2gs
             kGif = 1,
             kVSync = 2,
             kRead = 3,
+            kReadLate = 4, // a read whose answer the EE already took (path = qwords)
         };
 
         struct Record
@@ -168,6 +289,10 @@ namespace pcsx2gs
             return steps;
         }
 
+        class SdlHost;
+        // The host the EE's late reads go to (readLocalLate), while it runs.
+        std::atomic<SdlHost *> s_lateReads{nullptr};
+
         class SdlHost final : public PS2Runtime::HostFrontend
         {
         public:
@@ -176,6 +301,21 @@ namespace pcsx2gs
             bool initialize(PS2Runtime &runtime, const char *title) override
             {
                 m_runtime = &runtime;
+#if defined(_WIN32)
+                // Waits wake to the millisecond, not to Windows' default
+                // 15.6 ms tick: the VBlanks are paced by such waits.
+                timeBeginPeriod(1);
+                // Above other programs (a browser, an antivirus scan): with
+                // few CPU threads they otherwise take turns with the game's
+                // and a frame waits. The game sleeps when it is ahead, so it
+                // takes no more than it needs.
+                if (m_config.raisePriority)
+                    std::fprintf(stderr, "[host] priority: %s\n",
+                                 SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) ? "above normal"
+                                                                                                    : "normal (refused)");
+                else
+                    std::fprintf(stderr, "[host] priority: normal\n");
+#endif
                 if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
                 {
                     std::fprintf(stderr, "[host] SDL_Init: %s\n", SDL_GetError());
@@ -228,18 +368,45 @@ namespace pcsx2gs
                 nw.scale = SDL_GetWindowDisplayScale(m_window);
 
                 Settings settings;
+                settings.api = m_config.api;
                 settings.software = m_config.software;
                 settings.null = m_config.null;
                 settings.upscale = m_config.upscale;
                 settings.vsync = m_config.vsync;
                 if (const char *base = SDL_GetBasePath())
+                {
                     settings.cacheDir = std::string(base) + "cache";
+                    settings.programList = std::string(base) + "gh1_programs.bin";
+                }
                 std::string error;
-                if (!pcsx2gs::open(nw, settings, error))
+                bool opened = pcsx2gs::open(nw, settings, error);
+                if (!opened && settings.api != Api::OpenGL && !settings.software && !settings.null)
+                {
+                    // The API the ini asks for is not there (an old driver):
+                    // OpenGL rather than no game.
+                    std::fprintf(stderr, "[host] %s; trying OpenGL\n", error.c_str());
+                    settings.api = Api::OpenGL;
+                    opened = pcsx2gs::open(nw, settings, error);
+                }
+                if (!opened)
                 {
                     std::fprintf(stderr, "[host] %s\n", error.c_str());
                     return false;
                 }
+                std::fprintf(stderr, "[gs] renderer: %s\n", pcsx2gs::describe().c_str());
+                const unsigned threads = availableThreads();
+                std::fprintf(stderr, "[host] CPU: %s, %d threads (%u for this process); %d MB of memory\n",
+                             cpuName().c_str(), SDL_GetNumLogicalCPUCores(), threads, SDL_GetSystemRAM());
+                // VIF1 and VU1 on a thread of their own (vu1_thread): with
+                // two CPU threads or more free, by default, the EE's own
+                // thread no longer runs the VU1 programs. (Two threads at
+                // full speed, on Diego's PC: the EE's work went from ~14 ms a
+                // frame in a song to ~8, the VU1 thread's ~6, smooth.)
+                const bool vu1Thread = m_config.vu1Thread == 1 || (m_config.vu1Thread < 0 && threads >= 2);
+                if (vu1Thread)
+                    ps2x::vif1::start(runtime.memory());
+                std::fprintf(stderr, "[host] VU1: %s\n",
+                             vu1Thread ? "on its own thread" : "on the EE's thread");
 
                 // The runtime's own rasterizer stops; the GS gets every packet.
                 runtime.gs().setRasterBackend(std::make_unique<GSNullBackend>(
@@ -247,6 +414,7 @@ namespace pcsx2gs
                 ps2x::gs::setPacketTap([this](uint32_t path, const uint8_t *data, uint32_t bytes)
                                        { push(kGif, path, data, bytes); });
                 ps2x::host::setVBlankHook([this](uint64_t) { vblank(); });
+                s_lateReads.store(this, std::memory_order_release);
                 ps2x::host::setPadSource([this](int port, int slot, uint8_t *data, size_t size)
                                          { return readPad(port, slot, data, size); });
 
@@ -256,17 +424,35 @@ namespace pcsx2gs
                 }();
                 m_statsStart = std::chrono::steady_clock::now();
                 m_script = parseScript(std::getenv("GH1_SCRIPT"));
+                matchRefresh();
                 if (const char *v = std::getenv("GH1_DISPTRACE"))
                     std::sscanf(v, "%llu-%llu", reinterpret_cast<unsigned long long *>(&m_traceFrom),
                                 reinterpret_cast<unsigned long long *>(&m_traceTo));
                 if (const char *v = std::getenv("GH1_EXIT_AT"))
                     m_exitAt = std::strtoull(v, nullptr, 10);
+                if (const char *v = std::getenv("GH1_HITCH_MS"))
+                    m_hitchMs = std::atof(v);
+                m_hitchAll = envFlag("GH1_HITCH_ALL"); // also every frame that waited on the GPU or read VRAM
                 return true;
             }
 
             bool frame(PS2Runtime &runtime) override
             {
-                if (!pumpEvents() || (m_exitAt != 0 && m_frames >= m_exitAt))
+                // Window and controller events every 2 ms at most: this
+                // thread also draws everything the EE sends, often in many
+                // small batches a frame, and the game reads the pad once a
+                // frame.
+                bool running = true;
+                const auto pumpFrom = std::chrono::steady_clock::now();
+                if (pumpFrom - m_lastPump >= std::chrono::milliseconds(2))
+                {
+                    running = pumpEvents();
+                    m_lastPump = pumpFrom;
+                    const auto pumped = std::chrono::steady_clock::now() - pumpFrom;
+                    m_framePump += pumped;
+                    m_framePumpMax = std::max(m_framePumpMax, pumped);
+                }
+                if (!running || (m_exitAt != 0 && m_frames >= m_exitAt))
                 {
                     stop();
                     return false;
@@ -274,7 +460,13 @@ namespace pcsx2gs
                 {
                     std::unique_lock lock(m_mutex);
                     if (m_pending.empty())
+                    {
+                        m_hostWaiting = true;
+                        const auto waitFrom = std::chrono::steady_clock::now();
                         m_work.wait_for(lock, std::chrono::milliseconds(4));
+                        m_frameIdle += std::chrono::steady_clock::now() - waitFrom;
+                        m_hostWaiting = false;
+                    }
                     m_draining.swap(m_pending);
                 }
                 const uint32_t vsyncs = process(m_draining);
@@ -291,8 +483,29 @@ namespace pcsx2gs
                 return true;
             }
 
+            // A local-to-host read answered at once from local memory as the GS
+            // has it (what earlier reads brought back from video memory), the
+            // read itself queued behind the transfer's registers so that the
+            // GS brings that memory up to date for the next one. For reads a
+            // frame old serves as well as now (see gh1/flares.cpp): the EE
+            // neither waits for the GS to catch up nor for the GPU to finish.
+            void readLate(uint8_t *dst, uint32_t bytes, uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg)
+            {
+                pcsx2gs::readLocalNow(dst, bytes, bitbltbuf, trxpos, trxreg);
+                // Behind the transfer's registers, which may still be with
+                // the VIF1 thread.
+                const uint32_t qwc = (bytes + 15u) / 16u;
+                ps2x::vif1::post([this, qwc]() {
+                    std::lock_guard batchLock(m_batchMutex);
+                    append(Record{kReadLate, qwc, 0, 0}, nullptr, 0);
+                });
+                ++m_eeReads;
+            }
+
             void shutdown(PS2Runtime &) override
             {
+                s_lateReads.store(nullptr, std::memory_order_release);
+                ps2x::vif1::stop(); // its last packets reach the GS while it is still open
                 stop();
                 ps2x::host::setVBlankHook({});
                 ps2x::host::setPadSource({});
@@ -306,50 +519,188 @@ namespace pcsx2gs
                     SDL_DestroyWindow(m_window);
                 m_window = nullptr;
                 SDL_Quit();
+#if defined(_WIN32)
+                timeEndPeriod(1);
+#endif
             }
 
         private:
+            // With vsync on, the game's VBlanks at the monitor's own rate when
+            // it is the PS2's within 1% (a "60 Hz" monitor at 60.00 against
+            // NTSC's 59.94), or a whole multiple of it (120, 180, 240 Hz...):
+            // every picture then lasts the same number of refreshes, where
+            // 59.94 against 60.00 showed one picture twice every 17 seconds.
+            // (GH1 times its songs by the audio; the 0.1% only reaches menus
+            // and animations.)
+            void matchRefresh()
+            {
+                if (!m_config.vsync || !m_window || !m_runtime)
+                    return;
+                const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
+                if (!mode)
+                    return;
+                const double refresh = mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0
+                                           ? static_cast<double>(mode->refresh_rate_numerator) / mode->refresh_rate_denominator
+                                           : static_cast<double>(mode->refresh_rate);
+                constexpr double kNtsc = 60000.0 / 1001.0;
+                double rate = kNtsc;
+                for (const double divisor : {1.0, 2.0, 3.0, 4.0, 5.0, 6.0})
+                    if (std::abs(refresh / divisor - kNtsc) <= kNtsc * 0.01)
+                    {
+                        rate = refresh / divisor;
+                        break;
+                    }
+                m_runtime->eeScheduler().setVBlankPeriod(
+                    std::chrono::nanoseconds(static_cast<int64_t>(1e9 / rate + 0.5)));
+                std::fprintf(stderr, "[host] monitor at %.3f Hz: VBlanks at %.3f Hz\n", refresh, rate);
+            }
+
             // --- EE side --------------------------------------------------------
+
+            // The EE's records gather here and go to the GS thread in batches
+            // (kBatchBytes, or at once for a VBlank or a VRAM read): handing
+            // each GIF packet over by itself, with a wake-up of that thread,
+            // cost the EE a fifth of its time, hundreds of times a frame.
+            // Small enough that the GS draws a frame while the EE still
+            // makes it, so the frame can be shown as soon as its VBlank
+            // arrives (a big batch left at the VBlank put a variable delay
+            // before each picture): the GS thread is only woken when it is
+            // waiting for work, which keeps small batches cheap.
+            static constexpr size_t kBatchBytes = 48 * 1024;
+
+            void append(const Record &rec, const void *a, uint32_t aBytes, const void *b = nullptr, uint32_t bBytes = 0)
+            {
+                const size_t at = m_batch.size();
+                m_batch.resize(at + sizeof(Record) + ((rec.bytes + 15u) & ~15u));
+                std::memcpy(m_batch.data() + at, &rec, sizeof(rec));
+                if (aBytes)
+                    std::memcpy(m_batch.data() + at + sizeof(rec), a, aBytes);
+                if (bBytes)
+                    std::memcpy(m_batch.data() + at + sizeof(rec) + aBytes, b, bBytes);
+            }
+
+            // Hands the batch to the GS thread; m_batchMutex held, and
+            // m_mutex taken here.
+            void handOver(std::unique_lock<std::mutex> &lock, bool vsync)
+            {
+                if (m_pending.empty())
+                    m_pending.swap(m_batch);
+                else
+                    m_pending.insert(m_pending.end(), m_batch.begin(), m_batch.end());
+                m_batch.clear();
+                if (vsync)
+                    ++m_queuedVsyncs;
+                (void)lock;
+                if (m_hostWaiting || vsync)
+                    m_work.notify_one();
+            }
 
             void push(uint32_t type, uint32_t path, const void *data, uint32_t bytes)
             {
+                std::lock_guard batchLock(m_batchMutex);
+                append(Record{type, path, bytes, 0}, data, bytes);
+                if (m_batch.size() >= kBatchBytes)
                 {
-                    std::lock_guard lock(m_mutex);
-                    const size_t at = m_pending.size();
-                    m_pending.resize(at + sizeof(Record) + ((bytes + 15u) & ~15u));
-                    const Record rec{type, path, bytes, 0};
-                    std::memcpy(m_pending.data() + at, &rec, sizeof(rec));
-                    if (bytes)
-                        std::memcpy(m_pending.data() + at + sizeof(rec), data, bytes);
+                    std::unique_lock lock(m_mutex);
+                    handOver(lock, false);
                 }
-                m_work.notify_one();
             }
 
             void vblank()
             {
                 uint8_t regs[kPrivRegsSize];
                 privRegsPs2Layout(m_runtime->memory().gs(), regs);
-                std::unique_lock lock(m_mutex);
-                const size_t at = m_pending.size();
-                m_pending.resize(at + sizeof(Record) + kPrivRegsSize);
-                const Record rec{kVSync, 0, kPrivRegsSize, 0};
-                std::memcpy(m_pending.data() + at, &rec, sizeof(rec));
-                std::memcpy(m_pending.data() + at + sizeof(rec), regs, kPrivRegsSize);
-                ++m_queuedVsyncs;
-                m_work.notify_one();
-                // Too far ahead of the picture: the EE waits for the GS.
-                while (m_queuedVsyncs > kFramesAhead && !m_stopping && !m_runtime->isStopRequested())
+                // For the hitch log: the time since the last VBlank reached
+                // here (the EE's side of a late frame) and how long the EE
+                // then waited for the GS, in microseconds.
+                const auto now = std::chrono::steady_clock::now();
+                const uint32_t sinceLast = m_eeLastVblank.time_since_epoch().count() == 0
+                                               ? 0u
+                                               : static_cast<uint32_t>(std::min<int64_t>(
+                                                     std::chrono::duration_cast<std::chrono::microseconds>(now - m_eeLastVblank).count(),
+                                                     0xFFFFFFFF));
+                m_eeLastVblank = now;
+                const DiscReadStats disc = ps2TakeDiscReadStats();
+                EeTiming timing{sinceLast, m_eeWaitedUs, m_eeReadWaitUs.exchange(0), m_eeReads.exchange(0), 0, 0, 0,
+                                static_cast<uint32_t>(std::min<uint64_t>(disc.waitedUs, 0xFFFFFFFFu)),
+                                static_cast<uint32_t>(std::min<uint64_t>(ps2x::takePacingIdleNs() / 1000u, 0xFFFFFFFFu))};
+#if defined(GH1_PCSX2VU)
+                const pcsx2vu::Timing vu = pcsx2vu::takeTiming();
+                timing.vuRuns = vu.runs;
+                timing.vuTotal = static_cast<uint32_t>(std::min<uint64_t>(vu.totalNs / 1000u, 0xFFFFFFFFu));
+                timing.vuLongest = static_cast<uint32_t>(std::min<uint64_t>(vu.longestNs / 1000u, 0xFFFFFFFFu));
+                m_vuSlowRuns.fetch_add(vu.slowRuns, std::memory_order_relaxed);
+                m_vuClears.fetch_add(vu.clears, std::memory_order_relaxed);
+#endif
+                timing.vifBusy = static_cast<uint32_t>(std::min<uint64_t>(ps2x::vif1::takeBusyNs() / 1000u, 0xFFFFFFFFu));
+                timing.vifWait = static_cast<uint32_t>(std::min<uint64_t>(ps2x::vif1::takeDrainWaitNs() / 1000u, 0xFFFFFFFFu));
+                std::unique_lock<std::mutex> lock;
+                if (ps2x::vif1::active())
+                {
+                    // The frame's last packets may still be with the VIF1
+                    // thread: the VBlank's record goes behind them, there.
+                    std::vector<uint8_t> copy(regs, regs + kPrivRegsSize);
+                    m_postedVsyncs.fetch_add(1u);
+                    ps2x::vif1::post([this, copy = std::move(copy), timing]() {
+                        std::unique_lock batchLock(m_batchMutex);
+                        append(Record{kVSync, 0, kPrivRegsSize + sizeof(EeTiming), 0}, copy.data(), kPrivRegsSize,
+                               &timing, sizeof(timing));
+                        std::unique_lock lock(m_mutex);
+                        handOver(lock, true);
+                        m_postedVsyncs.fetch_sub(1u);
+                        lock.unlock();
+                        batchLock.unlock();
+                        m_space.notify_all();
+                    });
+                    lock = std::unique_lock(m_mutex);
+                }
+                else
+                {
+                    std::unique_lock batchLock(m_batchMutex);
+                    append(Record{kVSync, 0, kPrivRegsSize + sizeof(EeTiming), 0}, regs, kPrivRegsSize, &timing,
+                           sizeof(timing));
+                    lock = std::unique_lock(m_mutex);
+                    handOver(lock, true);
+                }
+                // Too far ahead of the picture: the EE waits for the GS (the
+                // VBlanks the VIF1 thread has yet to hand over count too).
+                const auto waitFrom = std::chrono::steady_clock::now();
+                while (m_queuedVsyncs + m_postedVsyncs.load() > kFramesAhead && !m_stopping &&
+                       !m_runtime->isStopRequested())
                     m_space.wait_for(lock, std::chrono::milliseconds(10));
+                m_eeWaitedUs = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                         std::chrono::steady_clock::now() - waitFrom)
+                                                         .count());
+                m_eeLastVblank += std::chrono::steady_clock::now() - waitFrom;
             }
 
+            // A local-to-host read of maxBytes. The GS sends whole qwords:
+            // a read that ends inside one (GH1's lens flares read a single
+            // 16-bit Z value) takes the whole qword and keeps what was asked.
             uint32_t readLocal(uint8_t *dst, uint32_t maxBytes)
             {
+                if ((maxBytes & 15u) != 0u)
+                {
+                    std::vector<uint8_t> whole((maxBytes + 15u) & ~15u);
+                    const uint32_t got = readLocal(whole.data(), static_cast<uint32_t>(whole.size()));
+                    const uint32_t keep = std::min(got, maxBytes);
+                    std::memcpy(dst, whole.data(), keep);
+                    return keep;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
                 ReadRequest req{dst, maxBytes / 16u, false};
                 const ReadRequest *ptr = &req;
-                push(kRead, 0, &ptr, sizeof(ptr));
+                std::unique_lock batchLock(m_batchMutex);
+                append(Record{kRead, 0, sizeof(ptr), 0}, &ptr, sizeof(ptr));
                 std::unique_lock lock(m_mutex);
+                handOver(lock, false);
+                batchLock.unlock();
                 while (!req.done && !m_stopping && !m_runtime->isStopRequested())
                     m_space.wait_for(lock, std::chrono::milliseconds(10));
+                lock.unlock();
+                m_eeReadWaitUs += static_cast<uint32_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+                ++m_eeReads;
                 return req.done ? req.qwc * 16u : 0u;
             }
 
@@ -394,22 +745,50 @@ namespace pcsx2gs
                     switch (rec.type)
                     {
                     case kGif:
+                    {
                         if (tracing())
                             traceFrames(rec.path, payload, rec.bytes);
+                        const auto t0 = std::chrono::steady_clock::now();
                         pcsx2gs::transfer(rec.path, payload, rec.bytes / 16u);
+                        m_frameGs += std::chrono::steady_clock::now() - t0;
                         break;
+                    }
                     case kVSync:
+                    {
                         if (tracing())
                             traceVsync(payload);
+                        const auto kept = std::chrono::steady_clock::now();
+                        pcsx2gs::keepLateReads();
+                        const auto t0 = std::chrono::steady_clock::now();
+                        m_frameCollect += t0 - kept;
                         pcsx2gs::vsync(payload);
+                        const auto t1 = std::chrono::steady_clock::now();
                         ++vsyncs;
                         presented();
+                        hitchCheck(payload, rec, t1 - t0, t1);
                         break;
+                    }
+                    case kReadLate:
+                    {
+                        m_lateScratch.resize(static_cast<size_t>(rec.path) * 16u);
+                        const auto t0 = std::chrono::steady_clock::now();
+                        if (!pcsx2gs::copyDepthLate())
+                        {
+                            pcsx2gs::readLocal(m_lateScratch.data(), rec.path);
+                            pcsx2gs::noteLateRead();
+                        }
+                        m_frameReads += std::chrono::steady_clock::now() - t0;
+                        ++m_frameReadCount;
+                        break;
+                    }
                     case kRead:
                     {
                         ReadRequest *req;
                         std::memcpy(&req, payload, sizeof(req));
+                        const auto t0 = std::chrono::steady_clock::now();
                         pcsx2gs::readLocal(req->dst, req->qwc);
+                        m_frameReads += std::chrono::steady_clock::now() - t0;
+                        ++m_frameReadCount;
                         {
                             std::lock_guard lock(m_mutex);
                             req->done = true;
@@ -425,6 +804,131 @@ namespace pcsx2gs
             }
 
             bool tracing() const { return m_traceTo != 0 && m_frames >= m_traceFrom && m_frames <= m_traceTo; }
+
+            // The hitch log: a frame shown late (more than GH1_HITCH_MS after
+            // the one before, 25 by default; 0 turns it off), or one that
+            // compiled shaders, gets a line with where its time went: the
+            // GS drawing it, presenting it, shaders, VRAM reads, and the EE
+            // (a VBlank that reached the host late, a wait for the GS), and
+            // for how many VBlanks the game has shown the same picture.
+            void hitchCheck(const uint8_t *regs, const Record &rec, std::chrono::steady_clock::duration present,
+                            std::chrono::steady_clock::time_point now)
+            {
+                EeTiming ee{};
+                if (rec.bytes >= kPrivRegsSize + sizeof(EeTiming))
+                    std::memcpy(&ee, regs + kPrivRegsSize, sizeof(ee));
+                using ms = std::chrono::duration<double, std::milli>;
+                uint64_t dispfb1, dispfb2;
+                std::memcpy(&dispfb1, regs + 0x70, 8);
+                std::memcpy(&dispfb2, regs + 0x90, 8);
+                const uint64_t shown = dispfb1 ^ (dispfb2 << 1);
+                m_samePicture = shown == m_lastShown ? m_samePicture + 1u : 0u;
+                m_lastShown = shown;
+                const pcsx2gs::Stalls stalls = pcsx2gs::takeStalls();
+                const double since = m_lastPresent.time_since_epoch().count() == 0 ? 0.0 : ms(now - m_lastPresent).count();
+                m_lastPresent = now;
+                const bool late = m_hitchMs > 0.0 && since > m_hitchMs && m_frames > 60;
+                const bool stalled = m_hitchAll && (stalls.loaded != 0 || stalls.gpuWaits != 0 || m_frameReadCount != 0);
+                if ((late || stalled || stalls.compiled != 0) && m_hitchLines < (m_hitchAll ? 200000u : 5000u))
+                {
+                    ++m_hitchLines;
+                    std::fprintf(stderr,
+                                 "[hitch] frame %llu: %.1f ms since the last (GS %.1f, present %.1f; shaders %u "
+                                 "compiled %.1f ms, %u from the cache %.1f ms; GPU waits %u %.1f ms; VRAM reads %u "
+                                 "%.1f ms, copies collected %.1f ms; events %.1f ms, longest %.1f; waiting for the EE %.1f ms; EE: VBlank after %.1f ms, asleep %.1f ms of it, waited %.1f ms, "
+                                 "VRAM reads %u waited %.1f ms, VU1 %u programs %.1f ms, longest %.1f, waited for the "
+                                 "VU1 thread %.1f ms, disc reads %.1f ms; same picture for %u)\n",
+                                 static_cast<unsigned long long>(m_frames), since, ms(m_frameGs).count(),
+                                 ms(present).count(), stalls.compiled, stalls.compiledMs, stalls.loaded, stalls.loadedMs,
+                                 stalls.gpuWaits, stalls.gpuWaitMs, m_frameReadCount, ms(m_frameReads).count(),
+                                 ms(m_frameCollect).count(), ms(m_framePump).count(), ms(m_framePumpMax).count(),
+                                 ms(m_frameIdle).count(), ee.sinceLast / 1000.0,
+                                 ee.idle / 1000.0, ee.vblankWait / 1000.0, ee.reads, ee.readWait / 1000.0, ee.vuRuns,
+                                 ee.vuTotal / 1000.0, ee.vuLongest / 1000.0, ee.vifWait / 1000.0, ee.discWait / 1000.0,
+                                 m_samePicture);
+                }
+                // The EE's own work in the frame: its time but for waiting on
+                // the clock, VRAM reads and the VIF1 thread (sinceLast already
+                // leaves out the wait for the GS at the VBlank before).
+                const double eeBusy =
+                    std::max(0.0, (static_cast<double>(ee.sinceLast) - ee.idle - ee.readWait - ee.vifWait) / 1000.0);
+                pace(since, ms(m_frameGs).count(), ms(present).count(), ee.sinceLast / 1000.0, eeBusy,
+                     ee.vuTotal / 1000.0, ee.vuRuns, ee.vifBusy / 1000.0, ee.vifWait / 1000.0);
+                m_frameGs = {};
+                m_frameReads = {};
+                m_frameCollect = {};
+                m_frameIdle = {};
+                m_frameReadCount = 0;
+                m_framePump = {};
+                m_framePumpMax = {};
+            }
+
+            // Every 10 s, how evenly the pictures came: the VBlanks, how many
+            // brought a new picture from the game and how many showed the
+            // last one again, how many were shown more than 20 ms after the
+            // one before, and the GS's, the presentation's and the EE's times
+            // (average and longest). A frame a little late, or a picture the
+            // game did not finish in time, is a small stutter the hitch log
+            // (25 ms and up) does not list.
+            void pace(double since, double gs, double present, double ee, double eeBusy, double vu, uint32_t vuRuns,
+                      double vif, double vifWait)
+            {
+                if (m_frames < 300)
+                    return;
+                ++m_paceFrames;
+                m_paceVif += vif;
+                m_paceVifWait += vifWait;
+                m_paceVifMax = std::max(m_paceVifMax, vif);
+                m_paceEe += ee;
+                m_paceEeBusy += eeBusy;
+                m_paceEeBusyMax = std::max(m_paceEeBusyMax, eeBusy);
+                m_paceVu += vu;
+                m_paceVuRuns += vuRuns;
+                m_paceRepeats += m_samePicture != 0 ? 1u : 0u;
+                m_paceLate += since > 20.0 ? 1u : 0u;
+                m_paceGs += gs;
+                m_paceGsMax = std::max(m_paceGsMax, gs);
+                m_pacePresent += present;
+                m_pacePresentMax = std::max(m_pacePresentMax, present);
+                m_paceSinceMax = std::max(m_paceSinceMax, since);
+                m_paceSince += since;
+                m_paceSince2 += since * since;
+                m_paceEeMax = std::max(m_paceEeMax, ee);
+                if (m_paceFrames < 600)
+                    return;
+                if (m_paceLines < 2000)
+                {
+                    ++m_paceLines;
+                    // The spread of the intervals between pictures: what an
+                    // uneven picture with no slow frame shows up as.
+                    const double mean = m_paceSince / m_paceFrames;
+                    const double spread = std::sqrt(std::max(0.0, m_paceSince2 / m_paceFrames - mean * mean));
+                    const pcsx2gs::VideoMemory vram = pcsx2gs::videoMemory();
+                    const auto mb = [](uint64_t bytes) { return static_cast<unsigned>(bytes >> 20); };
+                    std::fprintf(stderr,
+                                 "[pace] frame %llu, last %u VBlanks: %u repeated the picture, %u shown over 20 ms "
+                                 "(longest %.1f), every %.2f ms +- %.2f; GS %.1f ms avg, %.1f max; present %.1f avg, "
+                                 "%.1f max; EE %.1f avg, longest %.1f, working %.1f avg, %.1f max; VU1 %.1f ms, %u programs a frame, "
+                                 "%u over 1 ms, %u microcode uploads; VU1 thread %.1f ms avg, %.1f max, EE waited for it %.1f; "
+                                 "memory %u MB, VRAM %u MB "
+                                 "(textures %u, targets %u, hashed %u, pool %u)\n",
+                                 static_cast<unsigned long long>(m_frames), m_paceFrames, m_paceRepeats, m_paceLate,
+                                 m_paceSinceMax, mean, spread, m_paceGs / m_paceFrames, m_paceGsMax,
+                                 m_pacePresent / m_paceFrames, m_pacePresentMax, m_paceEe / m_paceFrames, m_paceEeMax,
+                                 m_paceEeBusy / m_paceFrames, m_paceEeBusyMax, m_paceVu / m_paceFrames,
+                                 m_paceVuRuns / m_paceFrames,
+                                 m_vuSlowRuns.exchange(0, std::memory_order_relaxed),
+                                 m_vuClears.exchange(0, std::memory_order_relaxed), m_paceVif / m_paceFrames, m_paceVifMax,
+                                 m_paceVifWait / m_paceFrames, processMegabytes(),
+                                 mb(vram.sources + vram.targets + vram.hashed + vram.pool), mb(vram.sources),
+                                 mb(vram.targets), mb(vram.hashed), mb(vram.pool));
+                }
+                m_paceFrames = m_paceRepeats = m_paceLate = 0;
+                m_paceGs = m_paceGsMax = m_pacePresent = m_pacePresentMax = m_paceSinceMax = m_paceEeMax = 0.0;
+                m_paceSince = m_paceSince2 = m_paceEe = m_paceVu = m_paceEeBusy = m_paceEeBusyMax = 0.0;
+                m_paceVif = m_paceVifMax = m_paceVifWait = 0.0;
+                m_paceVuRuns = 0;
+            }
 
             // GH1_DISPTRACE=<from>-<to>: per frame, the display registers at
             // VBlank and the framebuffers (FRAME_1/2 FBP) drawn to before it.
@@ -572,8 +1076,21 @@ namespace pcsx2gs
             {
                 bool keep = true;
                 SDL_Event ev;
-                while (SDL_PollEvent(&ev))
+                // SDL's own part (window messages, controllers) timed apart
+                // from handling the events, for the log: a pump that holds
+                // this thread up holds the picture up too.
+                const auto pumpFrom = std::chrono::steady_clock::now();
+                SDL_PumpEvents();
+                const auto sdlPart = std::chrono::steady_clock::now() - pumpFrom;
+                uint32_t eventCount = 0;
+                char eventTypes[96] = {};
+                size_t eventTypesUsed = 0;
+                while (SDL_PeepEvents(&ev, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) == 1)
                 {
+                    ++eventCount;
+                    if (eventTypesUsed + 8 < sizeof(eventTypes))
+                        eventTypesUsed += static_cast<size_t>(std::snprintf(
+                            eventTypes + eventTypesUsed, sizeof(eventTypes) - eventTypesUsed, " %x", ev.type));
                     if (m_options.handle(ev))
                         continue; // the options window's own
                     switch (ev.type)
@@ -594,6 +1111,10 @@ namespace pcsx2gs
                         if (!ev.key.repeat && ev.key.key == SDLK_F1 &&
                             s_screen.load(std::memory_order_acquire) == Screen::MainMenu)
                             m_options.toggle(m_window);
+                        break;
+                    case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+                        if (ev.window.windowID == SDL_GetWindowID(m_window))
+                            matchRefresh();
                         break;
                     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                         if (ev.window.windowID == SDL_GetWindowID(m_window))
@@ -627,6 +1148,15 @@ namespace pcsx2gs
                 if (m_options.isOpen() && s_screen.load(std::memory_order_acquire) != Screen::MainMenu)
                     m_options.close(); // the game left the main menu
                 m_options.draw();
+                using ms = std::chrono::duration<double, std::milli>;
+                const auto total = std::chrono::steady_clock::now() - pumpFrom;
+                if (total > std::chrono::milliseconds(20) && m_slowPumpLines < 500)
+                {
+                    ++m_slowPumpLines;
+                    std::fprintf(stderr, "[host] events took %.1f ms at frame %llu (SDL's own %.1f ms; %u events:%s)\n",
+                                 ms(total).count(), static_cast<unsigned long long>(m_frames), ms(sdlPart).count(),
+                                 eventCount, eventTypes);
+                }
                 return keep;
             }
 
@@ -911,6 +1441,8 @@ namespace pcsx2gs
             uint64_t m_unplugUntil = 0;
             std::atomic<uint64_t> m_pad{0x80808080FFFFull};
 
+            std::mutex m_batchMutex;         // EE side: m_batch (taken before m_mutex)
+            std::vector<uint8_t> m_batch;
             std::mutex m_mutex;
             std::condition_variable m_work;  // EE -> host: records queued
             std::condition_variable m_space; // host -> EE: vsyncs drained, reads done
@@ -918,6 +1450,7 @@ namespace pcsx2gs
             std::vector<uint8_t> m_draining;
             uint32_t m_queuedVsyncs = 0;
             bool m_stopping = false;
+            bool m_hostWaiting = false; // the GS thread waits for work (m_mutex)
 
             uint64_t m_frames = 0;
             uint64_t m_exitAt = 0;
@@ -930,10 +1463,50 @@ namespace pcsx2gs
             uint64_t m_shotFrom = 0;
             uint64_t m_statsFrames = 0;
             std::chrono::steady_clock::time_point m_statsStart;
+
+            // The hitch log (host side, then the EE's side).
+            uint32_t m_paceFrames = 0, m_paceRepeats = 0, m_paceLate = 0, m_paceLines = 0;
+            double m_paceGs = 0.0, m_paceGsMax = 0.0, m_pacePresent = 0.0, m_pacePresentMax = 0.0;
+            double m_paceEeBusy = 0.0, m_paceEeBusyMax = 0.0;
+            double m_paceVif = 0.0, m_paceVifMax = 0.0, m_paceVifWait = 0.0;
+            double m_paceSinceMax = 0.0, m_paceEeMax = 0.0, m_paceSince = 0.0, m_paceSince2 = 0.0, m_paceEe = 0.0,
+                   m_paceVu = 0.0;
+            uint32_t m_paceVuRuns = 0;
+            std::atomic<uint32_t> m_vuSlowRuns{0}, m_vuClears{0};
+            double m_hitchMs = 25.0;
+            bool m_hitchAll = false;
+            uint32_t m_hitchLines = 0;
+            std::chrono::steady_clock::duration m_frameGs{};
+            std::chrono::steady_clock::duration m_frameCollect{}; // late-read copies taken at the VBlank
+            std::chrono::steady_clock::duration m_frameIdle{};    // this thread waiting for the EE's records
+            std::chrono::steady_clock::duration m_frameReads{};
+            uint32_t m_frameReadCount = 0;
+            std::vector<uint8_t> m_lateScratch; // where late reads land (GS thread)
+            std::chrono::steady_clock::time_point m_lastPresent;
+            uint64_t m_lastShown = 0;
+            uint32_t m_samePicture = 0;
+            std::chrono::steady_clock::time_point m_lastPump;
+            uint32_t m_slowPumpLines = 0;
+            std::chrono::steady_clock::duration m_framePump{};
+            std::chrono::steady_clock::duration m_framePumpMax{};
+            std::chrono::steady_clock::time_point m_eeLastVblank; // EE thread from here on
+            uint32_t m_eeWaitedUs = 0;
+            std::atomic<uint32_t> m_eeReadWaitUs{0}; // VRAM reads come from the EE's GS side
+            std::atomic<uint32_t> m_eeReads{0};
+            std::atomic<uint32_t> m_postedVsyncs{0}; // VBlank records the VIF1 thread has yet to hand over
         };
     }
 
     void setScreen(Screen screen) { s_screen.store(screen, std::memory_order_release); }
+
+    bool readLocalLate(uint8_t *dst, uint32_t bytes, uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg)
+    {
+        SdlHost *host = s_lateReads.load(std::memory_order_acquire);
+        if (!host)
+            return false;
+        host->readLate(dst, bytes, bitbltbuf, trxpos, trxreg);
+        return true;
+    }
 
     PortOne portOne()
     {
@@ -962,6 +1535,21 @@ namespace pcsx2gs
             for (char &ch : v)
                 ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             return v;
+        };
+        // renderer = auto|opengl|d3d11|d3d12|sw (hw is the old name of opengl);
+        // the environment's GH1_RENDERER also takes null.
+        auto renderer = [&c](const char *r) {
+            const std::string v(r);
+            c.software = v == "sw";
+            c.null = v == "null";
+            if (v == "auto")
+                c.api = Api::Auto;
+            else if (v == "d3d11" || v == "dx11")
+                c.api = Api::Direct3D11;
+            else if (v == "d3d12" || v == "dx12")
+                c.api = Api::Direct3D12;
+            else if (v == "opengl" || v == "gl" || v == "hw")
+                c.api = Api::OpenGL;
         };
 
         // GH1Recomp.ini beside the exe: the settings before any [section];
@@ -993,13 +1581,19 @@ namespace pcsx2gs
             if (key == "upscale")
                 c.upscale = std::clamp(static_cast<float>(std::atof(value.c_str())), 1.0f, 8.0f);
             else if (key == "renderer")
-                c.software = value == "sw";
+                renderer(lower(value).c_str());
             else if (key == "vsync")
                 c.vsync = flag(value);
             else if (key == "window")
                 window(value.c_str());
             else if (key == "fullscreen")
                 c.fullscreen = flag(value);
+            else if (key == "venue")
+                c.venue = lower(value) != "off" && flag(value);
+            else if (key == "vu1_thread")
+                c.vu1Thread = lower(value) == "auto" ? -1 : (lower(value) != "off" && flag(value)) ? 1 : 0;
+            else if (key == "priority")
+                c.raisePriority = lower(value) != "normal";
         }
         std::string problems;
         keyboard::read(text, c.keyboard, problems);
@@ -1013,14 +1607,17 @@ namespace pcsx2gs
 
         c.upscale = std::clamp(envFloat("GH1_UPSCALE", c.upscale), 1.0f, 8.0f);
         if (const char *r = std::getenv("GH1_RENDERER"))
-        {
-            c.software = std::strcmp(r, "sw") == 0;
-            c.null = std::strcmp(r, "null") == 0;
-        }
+            renderer(r);
         if (std::getenv("GH1_VSYNC"))
             c.vsync = envFlag("GH1_VSYNC");
         if (std::getenv("GH1_FULLSCREEN"))
             c.fullscreen = envFlag("GH1_FULLSCREEN");
+        if (const char *v = std::getenv("GH1_VENUE"))
+            c.venue = std::strcmp(v, "off") != 0 && envFlag("GH1_VENUE");
+        if (std::getenv("GH1_VU1_THREAD"))
+            c.vu1Thread = envFlag("GH1_VU1_THREAD") ? 1 : 0;
+        if (const char *p = std::getenv("GH1_PRIORITY"))
+            c.raisePriority = lower(p) != "normal";
         c.stats = envFlag("GH1_STATS");
         c.guitar = !envFlag("GH1_JOYPAD");
         // GH1_KEYBOARD=strum|nostrum: the keyboard on, in that mode (tests).

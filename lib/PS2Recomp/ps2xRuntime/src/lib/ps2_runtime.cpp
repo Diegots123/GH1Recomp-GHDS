@@ -7,6 +7,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/vif1_worker.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -713,6 +714,15 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      dumpVu1Start(*this, 0u, startPC, top, itop);
+                                     if (ps2x::host::hasVu1Backend() && ps2x::vif1::onWorker())
+                                     {
+                                         // On the VIF1 thread: the EE's context is not ours to
+                                         // read or write; VU1 runs with no D/T breaks (FBRST 0).
+                                         (void)ps2x::host::runVu1({m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                                   m_memory.getVU1CodeGeneration(), startPC, false, top, itop,
+                                                                   0u});
+                                         return;
+                                     }
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -724,7 +734,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                              {m_memory.getVU1Code(), m_memory.getVU1Data(),
                                               m_memory.getVU1CodeGeneration(), startPC, false, top, itop,
                                               cpuContext->vu0_fbrst});
-                                         cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | (stop & 0x0600u);
+                                         // Written only when the stop bits change: on the VIF1
+                                         // thread the EE's context is the EE's.
+                                         if ((cpuContext->vu0_vpu_stat & 0x0600u) != (stop & 0x0600u))
+                                             cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | (stop & 0x0600u);
                                          return;
                                      }
                                      m_vu1.state().dBitEnabled =
@@ -741,6 +754,15 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      dumpVu1Start(*this, 1u, 0u, top, itop);
+                                     if (ps2x::host::hasVu1Backend() && ps2x::vif1::onWorker())
+                                     {
+                                         // On the VIF1 thread: the EE's context is not ours to
+                                         // read or write; VU1 runs with no D/T breaks (FBRST 0).
+                                         (void)ps2x::host::runVu1({m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                                   m_memory.getVU1CodeGeneration(), 0u, true, top, itop,
+                                                                   0u});
+                                         return;
+                                     }
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -752,7 +774,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                              {m_memory.getVU1Code(), m_memory.getVU1Data(),
                                               m_memory.getVU1CodeGeneration(), 0u, true, top, itop,
                                               cpuContext->vu0_fbrst});
-                                         cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | (stop & 0x0600u);
+                                         if ((cpuContext->vu0_vpu_stat & 0x0600u) != (stop & 0x0600u))
+                                             cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | (stop & 0x0600u);
                                          return;
                                      }
                                      m_vu1.state().dBitEnabled =

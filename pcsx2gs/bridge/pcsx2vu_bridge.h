@@ -48,4 +48,17 @@ namespace pcsx2vu
     };
 
     Result run(const Run &run);
+
+    // Time VU1 programs took since the last call: all of them, and the
+    // longest (microVU compiles a program the first time it meets it in a
+    // run, inside that run).
+    struct Timing
+    {
+        uint32_t runs = 0;
+        uint64_t totalNs = 0;
+        uint64_t longestNs = 0;
+        uint32_t slowRuns = 0; // programs that took over a millisecond: microVU compiling new code, mostly
+        uint32_t clears = 0;   // new microcode uploaded since the last run (microVU looks the program up again)
+    };
+    Timing takeTiming();
 }

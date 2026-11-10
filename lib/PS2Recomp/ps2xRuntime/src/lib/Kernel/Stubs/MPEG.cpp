@@ -1,3 +1,6 @@
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
@@ -1394,6 +1397,12 @@ namespace ps2_stubs
             }
         }
 
+        bool mpegTraceOn()
+        {
+            static const bool on = std::getenv("PS2X_MPEG_TRACE") != nullptr;
+            return on;
+        }
+
         bool mpegDemuxBackpressured(const MpegPlaybackState &playback)
         {
             // Let EOF finalization drain any tail that is already in the guest
@@ -2194,6 +2203,23 @@ namespace ps2_stubs
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
         }
+        if (mpegTraceOn())
+        {
+            char chain[160] = {};
+            size_t used = 0;
+            const uint32_t sp = getRegU32(ctx, 29);
+            for (uint32_t off = 0; off < 0x200u && used + 12 < sizeof(chain); off += 4u)
+                if (const uint8_t *w = getConstMemPtr(rdram, sp + off))
+                {
+                    uint32_t v;
+                    std::memcpy(&v, w, 4);
+                    if (v >= 0x100000u && v < 0x2a0000u && (v & 3u) == 0u) // GH1's code
+                        used += std::snprintf(chain + used, sizeof(chain) - used, " %x", v);
+                }
+            std::fprintf(stderr, "[mpegtr] demux ra=%x avail=%u consumed=%zu decoded %zu->%zu bp=%d tick=%llu stack%s\n",
+                         getRegU32(ctx, 31), availableBytes, consumed, decodedBefore, decodedCount, backpressured ? 1 : 0,
+                         static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), chain);
+        }
 
         if (backpressured)
         {
@@ -2307,6 +2333,10 @@ namespace ps2_stubs
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
+                if (mpegTraceOn())
+                    std::fprintf(stderr, "[mpegtr] getpicture waits for frames ra=%x served=%u tick=%llu\n",
+                                 getRegU32(ctx, 31), playback.picturesServed,
+                                 static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()));
                 lock.unlock();
                 runtime->eeScheduler().waitExternal(
                     EeWaitReason::Mpeg,
@@ -2358,6 +2388,9 @@ namespace ps2_stubs
                         });
                 }
 
+                if (mpegTraceOn())
+                    std::fprintf(stderr, "[mpegtr] getpicture frame %u queued=%zu tick=%llu\n", playback.picturesServed,
+                                 playback.decodedFrames.size(), static_cast<unsigned long long>(currentTick));
                 frame = std::move(playback.decodedFrames.front());
                 playback.decodedFrames.pop_front();
                 playback.width = static_cast<uint32_t>(frame.width);
@@ -2409,6 +2442,18 @@ namespace ps2_stubs
         if (haveFrame)
         {
             writeDecodedFrameToGuest(rdram, imageAddr, frame);
+            // Decoding a picture takes the IPU time, and its caller spends
+            // it: 0.000151 lines a pixel, as GH1's player budgets it (43
+            // lines at 640x448). The player then feeds the demuxer until line
+            // 523 of a two-field H-BLANK timer it zeroed at a vblank. Back at
+            // once, the call would leave that timer where the vblank found
+            // it, line 524 every other field: no feeding, and once the
+            // decoded pictures ran out the player waited here for good.
+            const uint64_t vblankCycles = static_cast<uint64_t>(
+                (static_cast<double>(runtime->eeScheduler().vblankPeriod().count()) * 294912000.0) / 1e9);
+            const double lines = static_cast<double>(width) * height * 0.000151;
+            runtime->eeScheduler().accountCycles(
+                static_cast<uint32_t>(std::min(lines * vblankCycles / 262.5, 4.0e6)));
         }
         else if (frameCount == 0u)
         {

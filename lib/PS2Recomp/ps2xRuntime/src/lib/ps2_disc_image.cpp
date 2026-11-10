@@ -3,6 +3,12 @@
 #include "ps2_runtime.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -35,12 +41,20 @@ namespace
 
         bool readFrame(uint32_t frame, uint8_t *dst) override
         {
-            if (frame >= frameCount)
+            return readFrames(frame, 1, dst);
+        }
+
+        bool readFrames(uint32_t first, uint32_t count, uint8_t *dst) override
+        {
+            if (count == 0)
+                return true;
+            if (first >= frameCount || count > frameCount - first)
                 return false;
+            const std::streamsize bytes = static_cast<std::streamsize>(count) * frameSize;
             m_file.clear();
-            m_file.seekg(static_cast<std::streamoff>(frame) * frameSize);
-            m_file.read(reinterpret_cast<char *>(dst), frameSize);
-            return m_file.gcount() == static_cast<std::streamsize>(frameSize);
+            m_file.seekg(static_cast<std::streamoff>(first) * frameSize);
+            m_file.read(reinterpret_cast<char *>(dst), bytes);
+            return m_file.gcount() == bytes;
         }
 
     private:
@@ -179,10 +193,182 @@ std::unique_ptr<DiscImage> DiscImage::open(const std::filesystem::path &path, st
     return nullptr;
 }
 
+namespace
+{
+    std::atomic<uint64_t> s_waitedUs{0};
+    std::atomic<uint32_t> s_reads{0};
+    std::atomic<uint32_t> s_ahead{0};
+    bool traceReads()
+    {
+        static const bool on = std::getenv("PS2X_CD_TRACE") != nullptr;
+        return on;
+    }
+}
+
+DiscReadStats ps2TakeDiscReadStats()
+{
+    return {s_waitedUs.exchange(0, std::memory_order_relaxed), s_reads.exchange(0, std::memory_order_relaxed),
+            s_ahead.exchange(0, std::memory_order_relaxed)};
+}
+
+// A game streaming from the disc (GH1's song audio: 64 KB a little over
+// every half second) reads one chunk after another, and each read used to
+// wait for the host's disk on the game's own thread; a slow or cold disk made
+// that a stall every chunk. Once a read follows on from the one before, the
+// next sectors are read here ahead of it, so the following chunks are already
+// in memory when the game asks. A read anywhere else is served as before.
+struct DiscImage::ReadAhead
+{
+    static constexpr uint32_t kWindow = 128;   // sectors a window holds (256 KB)
+    static constexpr uint32_t kWindows = 4;
+    static constexpr uint32_t kKeepAhead = 64; // sectors past a read that should be in hand
+
+    struct Window
+    {
+        uint32_t lbn = 0;
+        uint32_t count = 0; // 0: empty
+        bool filling = false;
+        uint64_t used = 0;  // for replacing the least recently used
+        std::vector<uint8_t> data;
+    };
+
+    explicit ReadAhead(DiscImage &disc) : m_disc(disc), m_thread([this] { run(); }) {}
+
+    ~ReadAhead()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_wake.notify_all();
+        m_thread.join();
+    }
+
+    // The request from the windows, waiting for one still being read that
+    // starts it; false when they do not hold it all.
+    bool serve(uint32_t lbn, uint32_t count, uint8_t *dst)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        for (;;)
+        {
+            Window *filling = nullptr;
+            for (Window &w : m_windows)
+            {
+                if (w.count == 0 || lbn < w.lbn || lbn >= w.lbn + w.count)
+                    continue;
+                if (w.filling)
+                {
+                    filling = &w;
+                    continue;
+                }
+                if (lbn + count > w.lbn + w.count)
+                    return false;
+                std::memcpy(dst, w.data.data() + static_cast<size_t>(lbn - w.lbn) * kSectorSize,
+                            static_cast<size_t>(count) * kSectorSize);
+                w.used = ++m_clock;
+                return true;
+            }
+            if (!filling)
+                return false;
+            m_done.wait(lock);
+        }
+    }
+
+    // After a read of [lbn, lbn + count): when it follows on from an earlier
+    // read, the sectors after it, unless a window has or is getting them.
+    void readPast(uint32_t lbn, uint32_t count)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const uint32_t end = lbn + count;
+        bool sequential = false;
+        for (uint32_t &last : m_lastEnds)
+            sequential = sequential || last == lbn;
+        m_lastEnds[m_nextEnd++ % std::size(m_lastEnds)] = end;
+        // A read inside a window continues a stream as well.
+        uint32_t covered = end;
+        for (bool grew = true; grew;)
+        {
+            grew = false;
+            for (const Window &w : m_windows)
+                if (w.count != 0 && covered >= w.lbn && covered < w.lbn + w.count)
+                {
+                    covered = w.lbn + w.count;
+                    sequential = true;
+                    grew = true;
+                }
+        }
+        if (!sequential || covered >= end + kKeepAhead || covered >= m_disc.sectorCount())
+            return;
+        if (m_pending.count != 0 && m_pending.lbn == covered)
+            return;
+        m_pending = {covered, std::min(kWindow, m_disc.sectorCount() - covered)};
+        m_wake.notify_one();
+    }
+
+private:
+    void run()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        for (;;)
+        {
+            m_wake.wait(lock, [this] { return m_stop || m_pending.count != 0; });
+            if (m_stop)
+                return;
+            const Request request = m_pending;
+            m_pending = {};
+            Window *slot = &m_windows[0];
+            for (Window &w : m_windows)
+                if (!w.filling && (w.count == 0 || w.used < slot->used || slot->filling))
+                    slot = &w;
+            if (slot->filling)
+                continue;
+            slot->lbn = request.lbn;
+            slot->count = request.count;
+            slot->filling = true;
+            slot->used = ++m_clock;
+            slot->data.resize(static_cast<size_t>(kWindow) * kSectorSize);
+            uint8_t *data = slot->data.data();
+            lock.unlock();
+            bool ok;
+            {
+                std::lock_guard<std::mutex> file(m_disc.m_mutex);
+                ok = m_disc.readSectorsLocked(request.lbn, request.count, data);
+            }
+            lock.lock();
+            slot->filling = false;
+            if (!ok)
+                slot->count = 0;
+            if (traceReads())
+                std::fprintf(stderr, "[cd] read ahead %u +%u%s\n", request.lbn, request.count, ok ? "" : " failed");
+            m_done.notify_all();
+        }
+    }
+
+    struct Request
+    {
+        uint32_t lbn = 0;
+        uint32_t count = 0;
+    };
+
+    DiscImage &m_disc;
+    std::mutex m_mutex;
+    std::condition_variable m_wake, m_done;
+    Window m_windows[kWindows];
+    Request m_pending;
+    uint32_t m_lastEnds[4] = {};
+    uint32_t m_nextEnd = 0;
+    uint64_t m_clock = 0;
+    bool m_stop = false;
+    std::thread m_thread;
+};
+
 DiscImage::DiscImage(std::unique_ptr<FrameSource> frames, uint32_t dataOffset)
     : m_frames(std::move(frames)), m_dataOffset(dataOffset)
 {
+    m_readAhead = std::make_unique<ReadAhead>(*this);
 }
+
+DiscImage::~DiscImage() = default;
 
 bool DiscImage::readSectorLocked(uint32_t lbn, uint8_t *dst)
 {
@@ -195,15 +381,39 @@ bool DiscImage::readSectorLocked(uint32_t lbn, uint8_t *dst)
     return true;
 }
 
-bool DiscImage::readSectors(uint32_t lbn, uint32_t count, uint8_t *dst)
+bool DiscImage::readSectorsLocked(uint32_t lbn, uint32_t count, uint8_t *dst)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_frames->frameSize == kSectorSize)
+        return m_frames->readFrames(lbn, count, dst);
     for (uint32_t i = 0; i < count; ++i)
     {
         if (!readSectorLocked(lbn + i, dst + static_cast<size_t>(i) * kSectorSize))
             return false;
     }
     return true;
+}
+
+bool DiscImage::readSectors(uint32_t lbn, uint32_t count, uint8_t *dst)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ahead = m_readAhead && m_readAhead->serve(lbn, count, dst);
+    bool ok = ahead;
+    if (!ahead)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ok = readSectorsLocked(lbn, count, dst);
+    }
+    if (ok && m_readAhead)
+        m_readAhead->readPast(lbn, count);
+    const uint64_t us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    s_waitedUs.fetch_add(us, std::memory_order_relaxed);
+    s_reads.fetch_add(1, std::memory_order_relaxed);
+    if (ahead)
+        s_ahead.fetch_add(1, std::memory_order_relaxed);
+    if (traceReads())
+        std::fprintf(stderr, "[cd] read %u +%u %s %.2f ms\n", lbn, count, ahead ? "ahead" : "disk", us / 1000.0);
+    return ok;
 }
 
 size_t DiscImage::readExtent(const Extent &extent, uint64_t offset, uint8_t *dst, size_t size)

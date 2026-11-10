@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_packet_tap.h"
+#include "runtime/vif1_worker.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
@@ -668,6 +669,60 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
+
+    // An external GS on the packet tap draws everything, from the same
+    // packets: here only what changes this GS's own state matters, A+D
+    // register writes (SIGNAL, FINISH, LABEL, transfers, ...) and IMAGE
+    // data. Vertices, colours and the other packed or REGLIST drawing
+    // registers would only build primitives for a backend that drops them.
+    if (s_packetTap)
+    {
+        uint32_t offset = 0;
+        while (offset + 16 <= sizeBytes)
+        {
+            const uint64_t tagLo = loadLE64(data + offset);
+            const uint64_t tagHi = loadLE64(data + offset + 8);
+            offset += 16;
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
+            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
+            if (nreg == 0)
+                nreg = 16;
+            recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+            if (flg == GIF_FMT_PACKED)
+            {
+                for (uint32_t loop = 0; loop < nloop; ++loop)
+                {
+                    for (uint32_t r = 0; r < nreg; ++r)
+                    {
+                        if (offset + 16 > sizeBytes)
+                            return;
+                        if (((tagHi >> (r * 4)) & 0xF) == 0xE)
+                            writeRegisterUnlocked(static_cast<uint8_t>(loadLE64(data + offset + 8) & 0xFF),
+                                                  loadLE64(data + offset));
+                        offset += 16;
+                    }
+                }
+            }
+            else if (flg == GIF_FMT_REGLIST)
+            {
+                const uint64_t words = static_cast<uint64_t>(nloop) * nreg;
+                const uint64_t bytes = ((words + 1u) / 2u) * 16u;
+                if (offset + bytes > sizeBytes)
+                    return;
+                offset += static_cast<uint32_t>(bytes);
+            }
+            else if (flg == GIF_FMT_IMAGE)
+            {
+                uint32_t imageBytes = nloop * 16;
+                if (offset + imageBytes > sizeBytes)
+                    imageBytes = sizeBytes - offset;
+                processImageData(data + offset, imageBytes);
+                offset += imageBytes;
+            }
+        }
+        return;
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -1611,7 +1666,9 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (drawing && m_backend)
+    // With an external GS on the packet tap, that GS draws: the batch here
+    // would only go to a backend that drops it.
+    if (drawing && m_backend && !s_packetTap)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
@@ -1667,6 +1724,10 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    // The transfer's registers may still be on their way through the VIF1
+    // thread (behind its data): they reach the GS first, and before this
+    // lock, which that thread's packets take too.
+    ps2x::vif1::drain();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }

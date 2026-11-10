@@ -10,6 +10,10 @@ add_library(ps2x_game OBJECT
     audio.cpp
     trace.cpp
     vu1.cpp
+    venue.cpp
+    extra_songs.cpp
+    flares.cpp
+    movie_audio.cpp
     launch.cpp
     ${GHC_SRC}/synth/module.cpp
     ${GHC_SRC}/synth/spu.cpp
@@ -52,6 +56,9 @@ if(GH1_PCSX2_DIR AND GH1_SDL3_DIR)
     target_compile_definitions(ps2x_game PRIVATE GH1_PCSX2GS=1 GH1_PCSX2VU=1)
     # VU1: PCSX2's microVU recompiler (see vu1.cpp).
     target_link_libraries(ps2x_game PRIVATE pcsx2gs_bridge pcsx2vu_bridge SDL3::SDL3-static)
+    if(WIN32)
+        target_link_libraries(ps2x_game PRIVATE winmm) # timeBeginPeriod
+    endif()
     # PCSX2's glad and the one inside raylib define the same symbols.
     set(PS2X_LOCALIZE_RAYLIB_GLAD ON PARENT_SCOPE)
 endif()

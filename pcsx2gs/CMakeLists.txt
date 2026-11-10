@@ -91,10 +91,17 @@ add_library(pcsx2gs STATIC
     ${G}/Renderers/OpenGL/GLState.cpp ${G}/Renderers/OpenGL/GLStreamBuffer.cpp
     ${G}/Renderers/OpenGL/GSDeviceOGL.cpp ${G}/Renderers/OpenGL/GSTextureOGL.cpp)
 if(WIN32)
-    # OpenGL only: shim/include/GS/Renderers/DX11 and DX12 stand in for the
-    # Direct3D renderers GS.cpp names on Windows.
-    target_sources(pcsx2gs PRIVATE ${G}/Renderers/OpenGL/GLContextWGL.cpp)
-    target_link_libraries(pcsx2gs PUBLIC opengl32 dwmapi shlwapi onecore)
+    # OpenGL and Direct3D 11 (the renderer PCSX2 picks for older GPUs, and
+    # often the faster one on integrated graphics). shim/include/GS/Renderers/DX12
+    # stands in for the Direct3D 12 device GS.cpp names. Direct3D 11 compiles
+    # its shaders with d3dcompiler_47.dll, part of Windows; D3D.cpp's DXC path
+    # (Direct3D 12 only) is delay-loaded, so dxcompiler.dll is never needed.
+    target_sources(pcsx2gs PRIVATE ${G}/Renderers/OpenGL/GLContextWGL.cpp
+        ${G}/Renderers/DX11/D3D.cpp ${G}/Renderers/DX11/D3D11ShaderCache.cpp
+        ${G}/Renderers/DX11/GSDevice11.cpp ${G}/Renderers/DX11/GSTexture11.cpp)
+    target_link_libraries(pcsx2gs PUBLIC opengl32 dwmapi shlwapi onecore d3d11 dxgi d3dcompiler dxguid
+        dxcompiler delayimp)
+    target_link_options(pcsx2gs PUBLIC /DELAYLOAD:dxcompiler.dll)
 else()
     target_sources(pcsx2gs PRIVATE ${G}/Renderers/OpenGL/GLContextEGL.cpp ${G}/Renderers/OpenGL/GLContextEGLX11.cpp)
 endif()

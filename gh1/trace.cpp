@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -470,11 +471,109 @@ namespace gh1
         }
     }
 
+    // GH1_TRACE=sdr: the movie sound's calls to libsd on the IOP
+    // (sceSdRemote: command, arguments, result) and the EE's SIF DMA to the
+    // IOP, the first few hundred.
+    struct SdRemoteTag;
+    bool onSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static unsigned n = 0;
+        const uint32_t a0 = GPR_U32(ctx, 4), cmd = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6), a3 = GPR_U32(ctx, 7);
+        const uint32_t t0 = GPR_U32(ctx, 8), t1 = GPR_U32(ctx, 9), t2 = GPR_U32(ctx, 10), ra = GPR_U32(ctx, 31);
+        gh2::Override<SdRemoteTag>::original()(rdram, ctx, runtime);
+        if (n++ < 400)
+            std::fprintf(stderr, "[sdr] %llu ra %x sceSdRemote(%x, cmd %x, %x, %x, %x, %x, %x) -> %x\n",
+                         static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), ra, a0, cmd, a2, a3, t0,
+                         t1, t2, GPR_U32(ctx, 2));
+        return true;
+    }
+    struct SifDmaTag;
+    void onSifDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static unsigned n = 0;
+        const uint32_t list = GPR_U32(ctx, 4), count = GPR_U32(ctx, 5);
+        for (uint32_t i = 0; i < count && i < 4 && n < 300; ++i, ++n)
+            std::fprintf(stderr, "[sdr] %llu ra %x SifSetDma src %x dst %x size %x attr %x\n",
+                         static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), GPR_U32(ctx, 31),
+                         gh2::load<uint32_t>(rdram, list + i * 16u), gh2::load<uint32_t>(rdram, list + i * 16u + 4u),
+                         gh2::load<uint32_t>(rdram, list + i * 16u + 8u), gh2::load<uint32_t>(rdram, list + i * 16u + 12u));
+    }
+
+    // GH1_TRACE=scores: high score entries set, lists made and added to.
+    struct ScoreSetTag;
+    void onScoreSet(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static unsigned n = 0;
+        if (n++ > 600)
+            return;
+        const uint32_t name = GPR_U32(ctx, 5);
+        char text[32] = {};
+        for (int i = 0; i < 31 && name; ++i)
+            if (!(text[i] = static_cast<char>(gh2::load<uint8_t>(rdram, name + i))))
+                break;
+        std::fprintf(stderr, "[scores] %llu Set entry %x name '%s' score %d ra %x\n",
+                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), GPR_U32(ctx, 4), text,
+                     static_cast<int>(GPR_U32(ctx, 6)), GPR_U32(ctx, 31));
+    }
+    struct SongScoresTag;
+    void onSongScores(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static unsigned n = 0;
+        if (n++ > 200)
+            return;
+        // Symbol: a pointer to its name.
+        const uint32_t sym = GPR_U32(ctx, 5);
+        char text[48] = {};
+        for (int i = 0; i < 47 && sym; ++i)
+            if (!(text[i] = static_cast<char>(gh2::load<uint8_t>(rdram, sym + i))))
+                break;
+        std::fprintf(stderr, "[scores] %llu SongHighScores(%x, '%s') ra %x\n",
+                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), GPR_U32(ctx, 4), text,
+                     GPR_U32(ctx, 31));
+    }
+    struct AddScoreTag;
+    void onAddScore(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::fprintf(stderr, "[scores] %llu HighScoreDB::AddHighScore(%x, name %x, %d) ra %x\n",
+                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), GPR_U32(ctx, 4),
+                     GPR_U32(ctx, 5), static_cast<int>(GPR_U32(ctx, 6)), GPR_U32(ctx, 31));
+    }
+    struct CheckScoreTag;
+    void onCheckScore(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::fprintf(stderr, "[scores] %llu HighScoreDB::CheckHighScore(%x, %d) ra %x\n",
+                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), GPR_U32(ctx, 4),
+                     static_cast<int>(GPR_U32(ctx, 5)), GPR_U32(ctx, 31));
+    }
+    struct CurrentListTag;
+    void onCurrentList(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static unsigned n = 0;
+        if (n++ > 40)
+            return;
+        std::fprintf(stderr, "[scores] %llu HighScoreDB::CurrentList(%x) ra %x\n",
+                     static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load()), GPR_U32(ctx, 4),
+                     GPR_U32(ctx, 31));
+    }
+
     void installTraces(PS2Runtime &runtime)
     {
         const char *which = std::getenv("GH1_TRACE");
         if (!which)
             return;
+        if (std::strstr(which, "scores"))
+        {
+            gh2::EntryHook<ScoreSetTag>::install(runtime, 0x14fe00u, onScoreSet);
+            gh2::EntryHook<SongScoresTag>::install(runtime, 0x150548u, onSongScores);
+            gh2::EntryHook<AddScoreTag>::install(runtime, 0x150e70u, onAddScore);
+            gh2::EntryHook<CheckScoreTag>::install(runtime, 0x150e18u, onCheckScore);
+            gh2::EntryHook<CurrentListTag>::install(runtime, 0x150da0u, onCurrentList);
+        }
+        if (std::strstr(which, "sdr"))
+        {
+            gh2::Override<SdRemoteTag>::install(runtime, 0x2766e8u, onSdRemote);
+            gh2::EntryHook<SifDmaTag>::install(runtime, 0x2771a0u, onSifDma);
+        }
         if (std::strstr(which, "files"))
         {
             gh2::EntryHook<ArkFileTag>::install(runtime, 0x227e48u, onArkFile);

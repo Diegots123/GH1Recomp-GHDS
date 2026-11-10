@@ -16,7 +16,15 @@ O QUE PRECISA
   nele), por exemplo em C:\Jogos\GH1Recomp. O OneDrive sincroniza os
   arquivos que o jogo grava enquanto voce joga.
 
-  Windows 10 ou 11 de 64 bits, placa de video com OpenGL 4.3 ou mais novo.
+  Windows 10 ou 11 de 64 bits, placa de video com OpenGL 4.3 ou Direct3D 11
+  (video integrado serve) e processador de 2 threads ou mais. Com 2 threads
+  roda liso; programas pesados abertos atras podem pesar.
+
+MUSICAS ESCONDIDAS
+  O disco do GH1 tem duas musicas completas que nenhuma lista do jogo mostra:
+  Graveyard Shift e Trippolette (de Andrew Buch). Aqui elas aparecem no fim da
+  lista do Quick Play, sem precisar desbloquear. Fora isso, Career e loja
+  continuam como no PS2.
 
 CONTROLES
   Como no PS2, a porta 1 e uma guitarra ou um DualShock 2:
@@ -72,8 +80,17 @@ CONTROLES
   F11 ou Alt+Enter: tela cheia.
 
 CONFIGURACOES
-  GH1Recomp.ini (resolucao interna, tela cheia, tamanho da janela, vsync;
-  o teclado tambem, mas e mais facil muda-lo pelo F1).
+  GH1Recomp.ini (resolucao interna, tela cheia, tamanho da janela, vsync,
+  renderizador; o teclado tambem, mas e mais facil muda-lo pelo F1).
+  PC fraco ou video integrado: upscale = 1 ou 2 e, se ficar pesado,
+  renderer = d3d11 (Direct3D 11), que costuma render mais nessas placas.
+  Ainda pesado: venue = off tira o palco, a banda e a plateia (fundo preto);
+  a jogabilidade nao muda.
+  vu1_thread = auto (padrao) roda o processador grafico do PS2 (VU1) numa
+  thread propria quando o PC tem 2 threads ou mais livres: menos trabalho
+  para a thread do jogo. on e off forcam.
+  priority = above_normal (padrao) deixa o jogo na frente dos programas
+  abertos atras (navegador, antivirus); normal volta ao de sempre.
 
 USO PESSOAL
   O GH1Recomp.exe contem codigo traduzido do executavel do seu proprio disco.

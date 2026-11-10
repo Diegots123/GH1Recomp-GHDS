@@ -13,8 +13,10 @@ O executável do jogo é traduzido para C++ e compilado para Windows (ou Linux).
 
 ## O que funciona
 
-- Boot, vídeos, menus, Quick Play e Career com músicas inteiras, e saves no cartão de memória (`memcards\`).
-- Vídeo pelo GS do PCSX2 em OpenGL (resolução interna 3× por padrão, tela cheia com F11 ou Alt+Enter); VU1 pelo microVU do PCSX2.
+- Boot, vídeos (com o som da abertura), menus, Quick Play e Career com músicas inteiras, e saves no cartão de memória (`memcards\`).
+- Vídeo pelo GS do PCSX2 em OpenGL ou Direct3D 11 (`renderer` no `GH1Recomp.ini`; resolução interna 3× por padrão, tela cheia com F11 ou Alt+Enter); VU1 pelo microVU do PCSX2, numa thread própria a partir de 2 threads de CPU.
+- Os reflexos de luz do palco, lidos do Z buffer um ou dois quadros depois (imperceptível), sem o jogo esperar a placa de vídeo.
+- Extras: as duas músicas completas que o disco tem e nenhuma lista mostra (Graveyard Shift e Trippolette) no fim do Quick Play, e `venue = off` para placas fracas (só a pista, sem o palco).
 - Controles: guitarras atuais (Xbox 360, PS3, Wii por raphnet, Rock Band 4, Riffmaster, World Tour de PC), guitarra e DualShock 2 de PS2 por adaptador USB, e teclado (configurado com F1 no menu principal).
 - Só abre com a imagem idêntica à do Redump: nada modificado.
 
@@ -51,7 +53,7 @@ python3 tools/gh1.py build --windows ~/xwin-sdk "/mnt/c/Jogos/Guitar Hero (USA).
 
 O `build` lê só o executável do disco (`SLUS_212.24`), confere o SHA-1, recompila, baixa o PCSX2 e o SDL3 nas versões fixadas e compila. Cada etapa grava um log em `build/`. Se a compilação parar por falta de memória, limite os processos em paralelo e rode o mesmo comando de novo: `CMAKE_BUILD_PARALLEL_LEVEL=2 python3 tools/gh1.py build ...`.
 
-**4. Jogar.** O resultado é `build/GH1Recomp-win64.zip`. Copie para o Windows (`cp build/GH1Recomp-win64.zip /mnt/c/Jogos/`), extraia, coloque a ISO na pasta `iso` e abra o `GH1Recomp.exe`. É preciso Windows 10 ou 11 de 64 bits e placa de vídeo com OpenGL 4.3.
+**4. Jogar.** O resultado é `build/GH1Recomp-win64.zip`. Copie para o Windows (`cp build/GH1Recomp-win64.zip /mnt/c/Jogos/`), extraia, coloque a ISO na pasta `iso` e abra o `GH1Recomp.exe`. É preciso Windows 10 ou 11 de 64 bits, placa de vídeo com OpenGL 4.3 ou Direct3D 11 (vídeo integrado serve) e processador de 2 threads ou mais.
 
 ### Linux
 
@@ -71,7 +73,7 @@ build/runtime/ps2xRuntime/ps2EntryRunner "Guitar Hero (USA).iso"
 - Os nomes das funções (`config/gh1-retail.symbols`, só endereços e nomes) vêm da lista pública do GH2 do GHClassic, transferidos por comparação de código (`tools/gh1_names.py`).
 - Só funções das bibliotecas da Sony e da libc com identidade provada são trocadas por código do runtime (`tools/gh1_stub_gate.py`); todo o código de jogo é o do GH1.
 - `pcsx2gs/` compila sozinho o GS e o microVU do PCSX2 (sem modificar o código deles) e liga ao jogo uma janela SDL3, com os controles e o som.
-- `gh1/` é a camada do GH1: o servidor de som (o módulo de synth do GHClassic), o áudio, os controles, o launcher e os traces de diagnóstico.
+- `gh1/` é a camada do GH1: o servidor de som (o módulo de synth do GHClassic), o áudio (com o dos vídeos), os controles, o launcher, os extras e os traces de diagnóstico.
 
 ## Estrutura
 
@@ -98,7 +100,7 @@ Este projeto é distribuído sob a **GPL-3.0** ([`LICENSE`](LICENSE)). O zip ger
 
 ## English
 
-A native PC recompilation of **Guitar Hero (PS2, USA, SLUS-21224, v1.00)**, built from **your own disc**. The game's executable is translated to C++ and compiled for Windows (or Linux). It runs GH1's own engine with no mods: the PS2's gameplay and timing, with faster loads, higher resolution and modern guitars.
+A native PC recompilation of **Guitar Hero (PS2, USA, SLUS-21224, v1.00)**, built from **your own disc**. The game's executable is translated to C++ and compiled for Windows (or Linux). It runs GH1's own engine with no mods: the PS2's gameplay and timing, with faster loads, higher resolution and modern guitars. Two extras: the disc's two hidden songs (Graveyard Shift, Trippolette) at the end of Quick Play, and `venue = off` (opt-in) for weak GPUs. OpenGL or Direct3D 11; the VU1 runs on its own thread.
 
 > **This repository contains nothing from the game**: no executable, audio, video, textures or recompiled code, and the Releases carry no exe. Everyone builds the game from their own disc image (Redump, Guitar Hero (USA) v1.00). The resulting exe holds code translated from your disc: **it is for you only; do not distribute it.** Unofficial; not affiliated with Harmonix, RedOctane or Activision.
 
@@ -114,6 +116,6 @@ python3 tools/gh1.py verify "Guitar Hero (USA).iso"
 python3 tools/gh1.py build --windows ~/xwin-sdk "Guitar Hero (USA).iso"
 ```
 
-This makes `build/GH1Recomp-win64.zip`: extract it, put the ISO in its `iso` folder and run `GH1Recomp.exe` (Windows 10/11 64-bit, OpenGL 4.3). For a Linux build, install the X11/OpenGL/ALSA/PulseAudio/D-Bus/udev/FFmpeg development packages listed above and run `tools/gh1.py build` without `--windows`.
+This makes `build/GH1Recomp-win64.zip`: extract it, put the ISO in its `iso` folder and run `GH1Recomp.exe` (Windows 10/11 64-bit, OpenGL 4.3 or Direct3D 11, a CPU with 2 threads or more). For a Linux build, install the X11/OpenGL/ALSA/PulseAudio/D-Bus/udev/FFmpeg development packages listed above and run `tools/gh1.py build` without `--windows`.
 
 **Credits:** [GH Classic](https://github.com/noahbaxter/GHClassic) (noahbaxter), which this project is built on; [PS2Recomp](https://github.com/ran-j/PS2Recomp); [PCSX2](https://github.com/PCSX2/pcsx2) (GS and microVU, unmodified); SDL3, SDL_GameControllerDB, raylib, FFmpeg. Licensed under the GPL-3.0.

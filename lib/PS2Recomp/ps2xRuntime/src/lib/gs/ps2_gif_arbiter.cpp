@@ -19,6 +19,18 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
     return flg == 2u;
 }
 
+namespace
+{
+    // Packets' buffers kept from one drain to the next: a frame of a game
+    // queues thousands of small packets (each VU1 XGKICK), and a buffer
+    // apiece from the heap every time is time the EE spends for nothing.
+    // Buffers of up to 64 KB, a few thousand of them; drain and submit run
+    // on the EE's thread.
+    constexpr size_t kPooledBufferMax = 64u * 1024u;
+    constexpr size_t kPoolMax = 8192u;
+    thread_local std::vector<std::vector<uint8_t>> t_buffers;
+}
+
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16 || !m_processFn)
@@ -28,8 +40,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    if (!t_buffers.empty())
+    {
+        pkt.data = std::move(t_buffers.back());
+        t_buffers.pop_back();
+    }
+    pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -61,6 +77,9 @@ void GifArbiter::drain()
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
+    for (auto &pkt : m_queue)
+        if (pkt.data.capacity() <= kPooledBufferMax && t_buffers.size() < kPoolMax)
+            t_buffers.push_back(std::move(pkt.data));
     m_queue.clear();
 }
 

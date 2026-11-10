@@ -17,6 +17,7 @@
 #include "synth.h"
 
 #include "audio.h"
+#include "movie_audio.h"
 #include "guest.h"
 #include "hook.h"
 #include "ps2_runtime_macros.h"
@@ -203,6 +204,7 @@ namespace gh1
         void render(float *out, size_t frames)
         {
             s_module.render(out, frames);
+            mixMovieAudio(out, frames); // the SPU2's sound data input: the movies' sound
         }
     }
 
