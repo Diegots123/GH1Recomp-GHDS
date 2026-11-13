@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Packages the Windows build: GH1Recomp.exe, the DLLs it loads, settings,
-the readme and every licence, zipped.
+"""Packages the Windows build: GH1Recomp.exe (or GH2Recomp.exe), the DLLs it
+loads, settings, the readme and every licence, zipped.
 
-    tools/package_windows.py <build dir> <output .zip>
+    tools/package_windows.py [--game gh1|gh2] <build dir> <output .zip>
 
 The exe holds code recompiled from the player's own disc: the package is
 for that player. Nothing from the disc itself goes in (the exe reads the
@@ -16,6 +16,13 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Each game's name, the folder its settings and readme come from, and its disc.
+GAMES = {
+    "gh1": ("GH1", ROOT / "dist" / "windows", "Guitar Hero (USA), SLUS-21224 v1.00"),
+    "gh2": ("GH2", ROOT / "dist" / "windows-gh2", "Guitar Hero II (USA), SLUS-21447 v1.00"),
+}
+GAME = "gh1"
 OBJDUMP = shutil.which("llvm-objdump-20") or shutil.which("llvm-objdump")
 
 
@@ -48,7 +55,7 @@ def licence_files(build):
     pcsx2 = cache_path(build, "GH1_PCSX2_DIR")
     sdl3 = cache_path(build, "GH1_SDL3_DIR")
     return [
-        ("GH1 Recomp", ROOT / "LICENSE"),
+        (f"{GAMES[GAME][0]} Recomp", ROOT / "LICENSE"),
         ("PS2Recomp (runtime)", ROOT / "lib" / "PS2Recomp" / "LICENSE"),
         ("PCSX2: GS, microVU and common code (GPL-3.0-or-later)", pcsx2 / "COPYING.GPLv3"),
         ("SDL3", sdl3 / "LICENSE.txt"),
@@ -62,33 +69,39 @@ def licence_files(build):
 
 
 def main():
-    if len(sys.argv) != 3:
+    global GAME
+    args = sys.argv[1:]
+    if args[:1] == ["--game"] and len(args) >= 2 and args[1] in GAMES:
+        GAME, args = args[1], args[2:]
+    if len(args) != 2:
         sys.exit(__doc__)
-    build, out_zip = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+    name, dist, disc = GAMES[GAME]
+    build, out_zip = Path(args[0]).resolve(), Path(args[1]).resolve()
     runner = build / "ps2xRuntime"
     exe = runner / "ps2EntryRunner.exe"
     with tempfile.TemporaryDirectory() as tmp:
-        stage = Path(tmp) / "GH1Recomp-win64"
+        stage = Path(tmp) / f"{name}Recomp-win64"
         (stage / "iso").mkdir(parents=True)
-        shutil.copy2(exe, stage / "GH1Recomp.exe")
+        shutil.copy2(exe, stage / f"{name}Recomp.exe")
         for dll in needed_dlls(exe, runner):
             shutil.copy2(dll, stage / dll.name)
-        for name in ("GH1Recomp.ini", "LEIA-ME.txt", "gamecontrollerdb.txt"):
-            shutil.copy2(ROOT / "dist" / "windows" / name, stage / name)
+        for f in (f"{name}Recomp.ini", "LEIA-ME.txt"):
+            shutil.copy2(dist / f, stage / f)
+        shutil.copy2(ROOT / "dist" / "windows" / "gamecontrollerdb.txt", stage / "gamecontrollerdb.txt")
         # The list of shader programs GH1 draws with, made by playing it: a
         # first run then prepares them all as it opens. Not in the public
         # repository (it is made from the game); each player's own runs
         # write theirs to cache\ anyway.
-        programs = ROOT / "dist" / "windows" / "gh1_programs.bin"
+        programs = dist / f"{GAME}_programs.bin"
         if programs.is_file():
             shutil.copy2(programs, stage / programs.name)
         # Windows line ends in the texts meant to be opened, however git checked them out.
-        for name in ("GH1Recomp.ini", "LEIA-ME.txt"):
-            text = stage / name
+        for f in (f"{name}Recomp.ini", "LEIA-ME.txt"):
+            text = stage / f
             text.write_bytes(text.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
         (stage / "iso" / "COLOQUE-A-ISO-AQUI.txt").write_text(
-            "Coloque aqui o .iso do seu Guitar Hero (USA), SLUS-21224 v1.00.\r\n"
-            "Put your Guitar Hero (USA) disc image (SLUS-21224 v1.00) here.\r\n")
+            f"Coloque aqui o .iso do seu {disc}.\r\n"
+            f"Put your {disc} disc image here.\r\n")
 
         text = []
         for title, path in licence_files(build):

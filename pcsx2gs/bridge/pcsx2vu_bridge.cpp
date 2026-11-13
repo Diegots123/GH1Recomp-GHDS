@@ -17,8 +17,10 @@
 #include "common/emitter/x86emitter.h"
 #include "pcsx2vu_shim.h"
 #include "pcsx2gs_host.h"
+#include "stall_probe.h"
 
 #include <cstdio>
+#include <string>
 #include <utility>
 #include <xmmintrin.h>
 
@@ -32,10 +34,20 @@ namespace pcsx2vu
         u8 *s_data = nullptr;
         u64 s_generation = 0;
 
+        // XGKICKs of the program running now (only the thread running VU1
+        // touches these): for the slow-program line.
+        u32 s_kicks = 0;
+        u64 s_kickTicks = 0;
+
         void kick(const u8 *packet, u32 size, void *)
         {
             if (s_kick)
+            {
+                const u64 t0 = __rdtsc();
                 s_kick(packet, size);
+                s_kickTicks += __rdtsc() - t0;
+                ++s_kicks;
+            }
         }
 
         // microVU compiles VU1 memory's address into its code, so a new
@@ -88,6 +100,8 @@ namespace pcsx2vu
         std::atomic<uint64_t> s_longestTicks{0};
         std::atomic<uint32_t> s_slowRuns{0};
         std::atomic<uint32_t> s_clears{0};
+        std::atomic<uint64_t> s_compiledBytes{0};
+        std::atomic<uint32_t> s_cacheResets{0};
         uint64_t s_calibTicks = 0;
         std::chrono::steady_clock::time_point s_calibTime;
         double s_nsPerTick = 0.0;
@@ -113,16 +127,64 @@ namespace pcsx2vu
         t.longestNs = static_cast<uint64_t>(static_cast<double>(s_longestTicks.exchange(0)) * s_nsPerTick);
         t.slowRuns = s_slowRuns.exchange(0);
         t.clears = s_clears.exchange(0);
+        t.compiledBytes = s_compiledBytes.exchange(0);
+        t.cacheResets = s_cacheResets.exchange(0);
         return t;
+    }
+
+    namespace
+    {
+        // What a program that took far too long did (GH2: one took a second
+        // in a song, once): its slices, cycles, code microVU compiled for it,
+        // its XGKICKs, and where the thread was meanwhile (stall_probe.h).
+        struct Detail
+        {
+            u32 startPC = 0;
+            bool resume = false;
+            int slices = 0;
+            u64 sliceTicks[8] = {};
+            u64 sliceCycles[8] = {};
+            s64 compiled = 0; // bytes of x86 code; negative: microVU's cache was reset
+            u32 kicks = 0;
+            u64 kickTicks = 0;
+        };
+        Detail s_detail;
+        unsigned s_slowLines = 0;
+        constexpr double kSlowProgramMs = 30.0;
     }
 
     static Result runProgram(const Run &r);
 
     Result run(const Run &r)
     {
+        thread_local stallprobe::Slot *probe = stallprobe::slot("VU1");
+        stallprobe::begin(probe);
+        s_detail.compiled = 0;
         const uint64_t t0 = __rdtsc();
         const Result result = runProgram(r);
         const uint64_t ticks = __rdtsc() - t0;
+        std::string where;
+        if (const double ms = stallprobe::end(probe, kSlowProgramMs, where); ms > 0.0 && s_slowLines < 100)
+        {
+            ++s_slowLines;
+            const Detail &d = s_detail;
+            const double nsPerTick = s_nsPerTick > 0.0 ? s_nsPerTick : 0.0;
+            std::string slices;
+            for (int i = 0; i < d.slices; ++i)
+            {
+                char part[64];
+                std::snprintf(part, sizeof(part), "%s%.1f ms %llu cycles", i ? ", " : "",
+                              d.sliceTicks[i] * nsPerTick / 1e6, static_cast<unsigned long long>(d.sliceCycles[i]));
+                slices += part;
+            }
+            std::fprintf(stderr,
+                         "[pcsx2 vu] a VU1 program took %.1f ms: pc %04x%s, %d slices (%s), %s, "
+                         "%u XGKICKs %.1f ms; %s\n",
+                         ms, d.startPC, d.resume ? " (continued)" : "", d.slices, slices.c_str(),
+                         d.compiled < 0 ? "microVU's code cache was reset"
+                                        : (std::to_string(d.compiled / 1024) + " KB of code compiled").c_str(),
+                         d.kicks, d.kickTicks * nsPerTick / 1e6, where.c_str());
+        }
         // The EE's thread runs VU1 and takes the timing: plain increments.
         s_runs.store(s_runs.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
         s_runTicks.store(s_runTicks.load(std::memory_order_relaxed) + ticks, std::memory_order_relaxed);
@@ -130,6 +192,10 @@ namespace pcsx2vu
             s_longestTicks.store(ticks, std::memory_order_relaxed);
         if (s_nsPerTick > 0.0 && static_cast<double>(ticks) * s_nsPerTick > 1e6)
             s_slowRuns.store(s_slowRuns.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
+        if (s_detail.compiled > 0)
+            s_compiledBytes.fetch_add(static_cast<uint64_t>(s_detail.compiled), std::memory_order_relaxed);
+        else if (s_detail.compiled < 0)
+            s_cacheResets.fetch_add(1u, std::memory_order_relaxed);
         return result;
     }
 
@@ -164,10 +230,29 @@ namespace pcsx2vu
         // the EE FPU's on exit; the host's own setting is kept around it.
         const unsigned int mxcsr = _mm_getcsr();
         const u64 startCycle = VU1.cycle;
+        Detail &d = s_detail;
+        d.startPC = VU1.VI[REG_TPC].UL << 3;
+        d.resume = r.resume;
+        d.slices = 0;
+        // microVU compiles at the emitter's pointer (this thread's) and
+        // leaves it where its code ends; a reset starts it over.
+        const u8 *codeBefore = x86Ptr;
+        s_kicks = 0;
+        s_kickTicks = 0;
         // vu1Finish's loop: a program runs until it ends, in slices.
         for (int slice = 0; (VU0.VI[REG_VPU_STAT].UL & 0x100) && slice < 8; ++slice)
+        {
+            const u64 sliceFrom = __rdtsc();
+            const u64 cycleFrom = VU1.cycle;
             CpuMicroVU1.Execute(vu1RunCycles);
+            d.sliceTicks[slice] = __rdtsc() - sliceFrom;
+            d.sliceCycles[slice] = VU1.cycle - cycleFrom;
+            d.slices = slice + 1;
+        }
         _mm_setcsr(mxcsr);
+        d.compiled = codeBefore ? static_cast<s64>(x86Ptr - codeBefore) : 0;
+        d.kicks = s_kicks;
+        d.kickTicks = s_kickTicks;
         if (VU0.VI[REG_VPU_STAT].UL & 0x100)
         {
             std::fprintf(stderr, "[pcsx2 vu] force stopping VU1, ran for too long (pc %04x)\n",

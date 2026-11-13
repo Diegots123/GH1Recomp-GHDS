@@ -556,6 +556,44 @@ namespace gh1
                      GPR_U32(ctx, 31));
     }
 
+    // CheatsManager::OnMsg(ButtonDownMsg) (0x22bb20, found by its code: GH1's
+    // names stop at the class), each button the
+    // cheats see (JoypadButton: 1 R2, 4 triangle, 5 circle, 6 X, 7
+    // square: a guitar's green, yellow, red, blue and orange), and once
+    // the long cheats' button lists; CallCheatScript (0x22b890): one
+    // entered (GH1_TRACE=cheats).
+    struct CheatButtonTag;
+    struct CheatScriptTag;
+    void onCheatButton(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static bool listed = false;
+        const uint32_t mgr = gh2::load<uint32_t>(rdram, 0x2f1e8cu);
+        if (!listed && mgr != 0u)
+        {
+            listed = true;
+            const uint32_t first = gh2::load<uint32_t>(rdram, mgr + 0x8u), last = gh2::load<uint32_t>(rdram, mgr + 0xcu);
+            for (uint32_t c = first; c < last && c - first < 64u * 0x14u; c += 0x14u)
+            {
+                std::cerr << "[gh1 cheats] long cheat:";
+                const uint32_t b = gh2::load<uint32_t>(rdram, c), e = gh2::load<uint32_t>(rdram, c + 4u);
+                for (uint32_t p = b; p < e && p - b < 64u; p += 4u)
+                    std::cerr << ' ' << gh2::load<int32_t>(rdram, p);
+                std::cerr << std::endl;
+            }
+        }
+        // The message's DataArray: node 2 the button, node 3 the pad.
+        const uint32_t msg = gh2::load<uint32_t>(rdram, GPR_U32(ctx, 5));
+        const uint32_t nodes = gh2::load<uint32_t>(rdram, msg);
+        std::cerr << "[gh1 cheats] button " << gh2::load<int32_t>(rdram, nodes + 0x10u) << " pad "
+                  << gh2::load<int32_t>(rdram, nodes + 0x18u) << " tick "
+                  << runtime->memory().gs().vsyncTick.load() << std::endl;
+    }
+    void onCheatScript(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::cerr << "[gh1 cheats] cheat entered, script " << std::hex << GPR_U32(ctx, 5) << std::dec << " tick "
+                  << runtime->memory().gs().vsyncTick.load() << std::endl;
+    }
+
     void installTraces(PS2Runtime &runtime)
     {
         const char *which = std::getenv("GH1_TRACE");
@@ -580,6 +618,11 @@ namespace gh1
             gh2::EntryHook<DataReadTag>::install(runtime, 0x2307f0u, onDataRead);
             gh2::EntryHook<ReadAsyncTag>::install(runtime, 0x227fe8u, onReadAsync);
             gh2::EntryHook<ReadDoneTag>::install(runtime, 0x228278u, onReadDone);
+        }
+        if (std::strstr(which, "cheats"))
+        {
+            gh2::EntryHook<CheatButtonTag>::install(runtime, 0x22bb20u, onCheatButton);
+            gh2::EntryHook<CheatScriptTag>::install(runtime, 0x22b890u, onCheatScript);
         }
         if (std::strstr(which, "modal"))
         {

@@ -56,6 +56,17 @@ namespace gh2::synth
         // they come.
         void setSamplesAfterStreamHeap(bool after) { m_samplesAfterHeap = after; }
 
+        // Audio calibration (the host's, not the IRX's): every stream's
+        // audio against the stream's own clock, as a disc whose song files
+        // were recorded again later (ms > 0: that much silence first) or
+        // earlier (ms < 0: their first ms left out). The positions the game
+        // reads are the same either way; what is heard at each moves. For
+        // streams created after the call.
+        void setStreamShiftMs(int32_t ms) { m_streamShiftMs = ms; }
+
+        // For traces: how often a stream's channel has run out of data.
+        uint32_t starves() const { return m_starves; }
+
         // Audio thread: `frames` of interleaved stereo at 48 kHz added to `out`.
         void render(float *out, size_t frames);
 
@@ -125,6 +136,8 @@ namespace gh2::synth
 
         uint32_t m_uploadDest = 0;
         bool m_samplesAfterHeap = false;
+        int32_t m_streamShiftMs = 0;
+        uint32_t m_starves = 0;
         uint32_t sampleBase() const;
         bool m_uploadDone = false;
         bool m_terminate = false;

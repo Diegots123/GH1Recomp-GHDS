@@ -1,9 +1,11 @@
 #include "pcsx2gs_sdl_host.h"
+#include "product.h"
 
 #include "pcsx2gs_bridge.h"
 #if defined(GH1_PCSX2VU)
 #include "pcsx2vu_bridge.h"
 #endif
+#include "stall_probe.h"
 #include "guitars.h"
 #include "keyboard_options.h"
 #include "runtime/gs/gs_null_backend.h"
@@ -373,10 +375,12 @@ namespace pcsx2gs
                 settings.null = m_config.null;
                 settings.upscale = m_config.upscale;
                 settings.vsync = m_config.vsync;
+                settings.halfPixelOffset = m_config.gsHalfPixelOffset;
+                settings.nativeScaling = m_config.gsNativeScaling;
                 if (const char *base = SDL_GetBasePath())
                 {
                     settings.cacheDir = std::string(base) + "cache";
-                    settings.programList = std::string(base) + "gh1_programs.bin";
+                    settings.programList = std::string(base) + GHR_PROGRAMS;
                 }
                 std::string error;
                 bool opened = pcsx2gs::open(nw, settings, error);
@@ -631,6 +635,8 @@ namespace pcsx2gs
                 timing.vuLongest = static_cast<uint32_t>(std::min<uint64_t>(vu.longestNs / 1000u, 0xFFFFFFFFu));
                 m_vuSlowRuns.fetch_add(vu.slowRuns, std::memory_order_relaxed);
                 m_vuClears.fetch_add(vu.clears, std::memory_order_relaxed);
+                m_vuCompiled.fetch_add(vu.compiledBytes, std::memory_order_relaxed);
+                m_vuResets.fetch_add(vu.cacheResets, std::memory_order_relaxed);
 #endif
                 timing.vifBusy = static_cast<uint32_t>(std::min<uint64_t>(ps2x::vif1::takeBusyNs() / 1000u, 0xFFFFFFFFu));
                 timing.vifWait = static_cast<uint32_t>(std::min<uint64_t>(ps2x::vif1::takeDrainWaitNs() / 1000u, 0xFFFFFFFFu));
@@ -909,7 +915,7 @@ namespace pcsx2gs
                                  "[pace] frame %llu, last %u VBlanks: %u repeated the picture, %u shown over 20 ms "
                                  "(longest %.1f), every %.2f ms +- %.2f; GS %.1f ms avg, %.1f max; present %.1f avg, "
                                  "%.1f max; EE %.1f avg, longest %.1f, working %.1f avg, %.1f max; VU1 %.1f ms, %u programs a frame, "
-                                 "%u over 1 ms, %u microcode uploads; VU1 thread %.1f ms avg, %.1f max, EE waited for it %.1f; "
+                                 "%u over 1 ms, %u microcode uploads, %llu KB compiled, %u cache resets; VU1 thread %.1f ms avg, %.1f max, EE waited for it %.1f; "
                                  "memory %u MB, VRAM %u MB "
                                  "(textures %u, targets %u, hashed %u, pool %u)\n",
                                  static_cast<unsigned long long>(m_frames), m_paceFrames, m_paceRepeats, m_paceLate,
@@ -918,7 +924,9 @@ namespace pcsx2gs
                                  m_paceEeBusy / m_paceFrames, m_paceEeBusyMax, m_paceVu / m_paceFrames,
                                  m_paceVuRuns / m_paceFrames,
                                  m_vuSlowRuns.exchange(0, std::memory_order_relaxed),
-                                 m_vuClears.exchange(0, std::memory_order_relaxed), m_paceVif / m_paceFrames, m_paceVifMax,
+                                 m_vuClears.exchange(0, std::memory_order_relaxed),
+                                 static_cast<unsigned long long>(m_vuCompiled.exchange(0, std::memory_order_relaxed) / 1024),
+                                 m_vuResets.exchange(0, std::memory_order_relaxed), m_paceVif / m_paceFrames, m_paceVifMax,
                                  m_paceVifWait / m_paceFrames, processMegabytes(),
                                  mb(vram.sources + vram.targets + vram.hashed + vram.pool), mb(vram.sources),
                                  mb(vram.targets), mb(vram.hashed), mb(vram.pool));
@@ -1080,8 +1088,12 @@ namespace pcsx2gs
                 // from handling the events, for the log: a pump that holds
                 // this thread up holds the picture up too.
                 const auto pumpFrom = std::chrono::steady_clock::now();
+                thread_local stallprobe::Slot *probe = stallprobe::slot("events");
+                stallprobe::begin(probe);
                 SDL_PumpEvents();
                 const auto sdlPart = std::chrono::steady_clock::now() - pumpFrom;
+                std::string where;
+                stallprobe::end(probe, 100.0, where);
                 uint32_t eventCount = 0;
                 char eventTypes[96] = {};
                 size_t eventTypesUsed = 0;
@@ -1110,7 +1122,21 @@ namespace pcsx2gs
                         // F1: the keyboard options, on the main menu only.
                         if (!ev.key.repeat && ev.key.key == SDLK_F1 &&
                             s_screen.load(std::memory_order_acquire) == Screen::MainMenu)
+                        {
+                            // Over the game in fullscreen, the options window
+                            // stayed unseen until something was clicked (an
+                            // OpenGL window filling the screen on Windows):
+                            // the game leaves fullscreen while it is open,
+                            // and goes back when it closes.
+                            if (!m_options.isOpen() && (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN))
+                            {
+                                SDL_SetWindowFullscreen(m_window, false);
+                                SDL_SyncWindow(m_window);
+                                m_fullscreenAfterOptions = true;
+                                std::fprintf(stderr, "[host] F1: out of fullscreen while the options are open\n");
+                            }
                             m_options.toggle(m_window);
+                        }
                         break;
                     case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
                         if (ev.window.windowID == SDL_GetWindowID(m_window))
@@ -1147,15 +1173,22 @@ namespace pcsx2gs
                 updatePad();
                 if (m_options.isOpen() && s_screen.load(std::memory_order_acquire) != Screen::MainMenu)
                     m_options.close(); // the game left the main menu
+                if (m_fullscreenAfterOptions && !m_options.isOpen())
+                {
+                    m_fullscreenAfterOptions = false;
+                    SDL_SetWindowFullscreen(m_window, true);
+                    SDL_RaiseWindow(m_window);
+                    std::fprintf(stderr, "[host] options closed: back to fullscreen\n");
+                }
                 m_options.draw();
                 using ms = std::chrono::duration<double, std::milli>;
                 const auto total = std::chrono::steady_clock::now() - pumpFrom;
                 if (total > std::chrono::milliseconds(20) && m_slowPumpLines < 500)
                 {
                     ++m_slowPumpLines;
-                    std::fprintf(stderr, "[host] events took %.1f ms at frame %llu (SDL's own %.1f ms; %u events:%s)\n",
+                    std::fprintf(stderr, "[host] events took %.1f ms at frame %llu (SDL's own %.1f ms; %u events:%s)%s%s\n",
                                  ms(total).count(), static_cast<unsigned long long>(m_frames), ms(sdlPart).count(),
-                                 eventCount, eventTypes);
+                                 eventCount, eventTypes, where.empty() ? "" : "; ", where.c_str());
                 }
                 return keep;
             }
@@ -1168,21 +1201,51 @@ namespace pcsx2gs
                 // A PS2 guitar on a PS2-to-USB adapter ("Twin USB Joystick")
                 // is the adapter's gamepad, holding D-Left as every PS2 guitar
                 // does, from the moment it is there: a gamepad that holds it
-                // from its first second for kAdapterGuitarFrames is that
-                // guitar, and its buttons and sticks pass through as is. One
-                // that does not, or lets go, is a DualShock for good (so a
-                // DualShock's D-Left never makes it a guitar).
+                // from the first second after its first button (an adapter
+                // may tell nothing until a button changes, or have its port
+                // empty for a while; a button, since an empty port may hold
+                // the stick to the left) for kAdapterGuitarFrames is that
+                // guitar, and its buttons and sticks pass through as is. Many adapters
+                // give a pad in digital mode (as a guitar is: nothing on the
+                // adapter's side turns it analog) its d-pad as the left stick:
+                // D-Left is then the stick held to the left, and the guitar's
+                // d-pad (the strum) is read from the stick. One that does
+                // not hold it, or lets go, is a DualShock for good (so a
+                // DualShock's D-Left never makes it a guitar for long).
+                // gamepad = guitar or dualshock in the ini decides instead.
                 for (guitars::Device &d : m_devices)
                 {
-                    if (d.guitar || !d.gamepad || d.notGuitar)
+                    if (d.guitar || !d.gamepad || d.notGuitar || m_config.gamepadAs != GamepadAs::Auto)
                         continue;
-                    ++d.age;
-                    if (SDL_GetGamepadButton(d.gamepad, SDL_GAMEPAD_BUTTON_DPAD_LEFT))
+                    const bool hatLeft = SDL_GetGamepadButton(d.gamepad, SDL_GAMEPAD_BUTTON_DPAD_LEFT);
+                    const bool stickLeft = SDL_GetGamepadAxis(d.gamepad, SDL_GAMEPAD_AXIS_LEFTX) <= -kStickDpad;
+                    if (!d.heard)
                     {
+                        // A button: the stick alone does not count, since an
+                        // empty port of a Twin USB adapter sends the stick
+                        // held to the left as a guitar does.
+                        for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && !d.heard; ++b)
+                            d.heard = SDL_GetGamepadButton(d.gamepad, static_cast<SDL_GamepadButton>(b));
+                        if (!d.heard)
+                            continue;
+                    }
+                    ++d.age;
+                    const bool wasGuitar = d.leftHeld >= kAdapterGuitarFrames;
+                    if (hatLeft || stickLeft)
+                    {
+                        d.dpadOnStick = !hatLeft;
+                        d.leftFree = 0;
                         if (d.leftHeld < kAdapterGuitarFrames)
                             ++d.leftHeld;
                     }
-                    else if (d.leftHeld >= kAdapterGuitarFrames || d.age > kAdapterGraceFrames)
+                    else if (wasGuitar)
+                    {
+                        // Let go for a while (not for a strum on an adapter
+                        // that drops it then): a DualShock after all.
+                        if (++d.leftFree >= kAdapterLetGoFrames)
+                            d.notGuitar = true;
+                    }
+                    else if (d.age > kAdapterGraceFrames)
                     {
                         d.notGuitar = true;
                     }
@@ -1190,9 +1253,60 @@ namespace pcsx2gs
                     {
                         d.leftHeld = 0;
                     }
+                    const bool isGuitar = d.leftHeld >= kAdapterGuitarFrames && !d.notGuitar;
+                    if (isGuitar != wasGuitar || (d.notGuitar && wasGuitar))
+                        std::fprintf(stderr, "[host] controller: %s: %s\n", SDL_GetGamepadName(d.gamepad),
+                                     !isGuitar        ? "a DualShock 2 (D-Left let go)"
+                                     : d.dpadOnStick ? "a PS2 guitar on an adapter (D-Left held, the d-pad on the left stick)"
+                                                     : "a PS2 guitar on an adapter (D-Left held)");
+                    else if (d.notGuitar)
+                        std::fprintf(stderr, "[host] controller: %s: a DualShock 2 (no D-Left held)\n",
+                                     SDL_GetGamepadName(d.gamepad));
                 }
-                auto adapterGuitar = [](const guitars::Device &d)
-                { return !d.guitar && !d.notGuitar && d.leftHeld >= kAdapterGuitarFrames; };
+                // What each gamepad that is no known guitar sends, raw (its
+                // buttons, hats and axes as the adapter numbers them, an axis
+                // as -1, 0 or 1 by where it is), each time it changes, up to
+                // kRawLines lines a gamepad: what a PS2 guitar on an adapter
+                // turns into is in the log.
+                for (guitars::Device &d : m_devices)
+                {
+                    if (d.guitar || !d.joystick || d.rawLines >= kRawLines)
+                        continue;
+                    std::string now;
+                    char part[32];
+                    uint32_t buttons = 0;
+                    for (int b = 0; b < std::min(SDL_GetNumJoystickButtons(d.joystick), 32); ++b)
+                        if (SDL_GetJoystickButton(d.joystick, b))
+                            buttons |= 1u << b;
+                    std::snprintf(part, sizeof(part), "buttons %x", buttons);
+                    now += part;
+                    for (int h = 0; h < std::min(SDL_GetNumJoystickHats(d.joystick), 4); ++h)
+                    {
+                        std::snprintf(part, sizeof(part), " hat%d %x", h, SDL_GetJoystickHat(d.joystick, h));
+                        now += part;
+                    }
+                    now += " axes";
+                    for (int a = 0; a < std::min(SDL_GetNumJoystickAxes(d.joystick), 8); ++a)
+                    {
+                        const int v = SDL_GetJoystickAxis(d.joystick, a);
+                        now += v <= -kStickDpad ? " -1" : v >= kStickDpad ? " 1" : " 0";
+                    }
+                    if (now != d.rawLast)
+                    {
+                        d.rawLast = now;
+                        ++d.rawLines;
+                        std::fprintf(stderr, "[host] raw %s #%u frame %llu: %s\n", SDL_GetJoystickName(d.joystick),
+                                     static_cast<unsigned>(d.id), static_cast<unsigned long long>(m_frames), now.c_str());
+                    }
+                }
+                auto adapterGuitar = [this](const guitars::Device &d)
+                {
+                    if (d.guitar || !d.gamepad)
+                        return false;
+                    if (m_config.gamepadAs != GamepadAs::Auto)
+                        return m_config.gamepadAs == GamepadAs::Guitar;
+                    return !d.notGuitar && d.leftHeld >= kAdapterGuitarFrames;
+                };
 
                 // What port 1 is. The keyboard turned on plays before any
                 // controller; off, it plays only while none is connected.
@@ -1217,6 +1331,53 @@ namespace pcsx2gs
                 // GH1_TEST_FLIP=1 (tests): F9 makes port 1 the other kind for
                 // a few seconds, wherever the game is, as a controller swapped
                 // and swapped back.
+                // GH1_TEST_ADAPTER=guitar|guitar-stick|pad (tests): a virtual gamepad
+                // plugged in at 2 s that tells nothing for 3 s (as an adapter
+                // that reports only changes), then holds D-Left for good
+                // (guitar: plus frets and strums now and then) or presses X
+                // and later holds D-Left for 3 s (pad).
+                static const char *testAdapter = std::getenv("GH1_TEST_ADAPTER");
+                if (testAdapter)
+                {
+                    if (m_frames >= 120u && !m_testPadMade)
+                    {
+                        m_testPadMade = true;
+                        SDL_VirtualJoystickDesc desc;
+                        SDL_INIT_INTERFACE(&desc);
+                        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+                        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+                        desc.nbuttons = SDL_GAMEPAD_BUTTON_DPAD_RIGHT + 1;
+                        desc.name = "Test adapter";
+                        const SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
+                        m_testPad = id ? SDL_OpenJoystick(id) : nullptr;
+                    }
+                    if (m_testPad)
+                    {
+                        const bool guitar = std::strcmp(testAdapter, "guitar") == 0;
+                        const bool guitarStick = std::strcmp(testAdapter, "guitar-stick") == 0;
+                        const uint64_t t = m_frames;
+                        auto set = [&](SDL_GamepadButton b, bool down) { SDL_SetJoystickVirtualButton(m_testPad, b, down); };
+                        if (guitarStick)
+                        {
+                            // A guitar in digital mode on an adapter that gives it the d-pad as the stick.
+                            SDL_SetJoystickVirtualAxis(m_testPad, SDL_GAMEPAD_AXIS_LEFTX, t >= 300u ? -32768 : 0);
+                            SDL_SetJoystickVirtualAxis(m_testPad, SDL_GAMEPAD_AXIS_LEFTY,
+                                                       t >= 600u && t % 120u < 6u ? 32767 : 0); // a strum down every 2 s
+                            set(SDL_GAMEPAD_BUTTON_EAST, t >= 600u && t % 120u < 60u);           // red held for 1 s
+                        }
+                        else if (guitar)
+                        {
+                            set(SDL_GAMEPAD_BUTTON_DPAD_LEFT, t >= 300u);
+                            set(SDL_GAMEPAD_BUTTON_DPAD_DOWN, t >= 600u && t % 120u < 6u); // a strum every 2 s
+                            set(SDL_GAMEPAD_BUTTON_EAST, t >= 600u && t % 120u < 60u);     // red held for 1 s
+                        }
+                        else
+                        {
+                            set(SDL_GAMEPAD_BUTTON_SOUTH, t >= 300u && t < 310u);
+                            set(SDL_GAMEPAD_BUTTON_DPAD_LEFT, t >= 600u && t < 780u);
+                        }
+                    }
+                }
                 static const bool testFlip = std::getenv("GH1_TEST_FLIP") != nullptr;
                 bool scriptFlip = false;
                 for (const ScriptStep &st : m_script)
@@ -1317,6 +1478,19 @@ namespace pcsx2gs
                         for (int k = 0; k < keyboard::kMenuKeyCount; ++k)
                             if (down(kb.menu[k]))
                                 pressed |= kBits[k];
+                        // Playing as a guitar, the fret keys are its frets in
+                        // the menus too, as a guitar's are (green selects and
+                        // red goes back there): the main menu's cheats are
+                        // fret presses. A fret key that is also a menu key
+                        // does only what the menus give it.
+                        if (guitarPort)
+                        {
+                            static constexpr uint16_t kFretBits[] = {kR2, kCircle, kTriangle, kCross, kSquare};
+                            for (int k = keyboard::kStrumGreen; k <= keyboard::kStrumOrange; ++k)
+                                if (std::find(kb.menu.begin(), kb.menu.end(), kb.strum[k]) == kb.menu.end() &&
+                                    down(kb.strum[k]))
+                                    pressed |= kFretBits[k - keyboard::kStrumGreen];
+                        }
                     }
                     if (keyWhammy)
                         whammy = wave;
@@ -1362,6 +1536,21 @@ namespace pcsx2gs
                         mine |= kL2;
                     if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384)
                         mine |= kR2;
+                    if (adapterGuitar(d))
+                    {
+                        // A guitar whose d-pad comes as the left stick (see
+                        // above; with gamepad = guitar, known by the stick held
+                        // to the left with no D-Left): the stick is its d-pad.
+                        const Sint16 sx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX);
+                        const Sint16 sy = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+                        if (m_config.gamepadAs == GamepadAs::Guitar && (mine & kLeft) == 0 && sx <= -kStickDpad)
+                            d.dpadOnStick = true;
+                        if (d.dpadOnStick)
+                        {
+                            mine |= (sx <= -kStickDpad / 2 ? kLeft : 0) | (sx >= kStickDpad / 2 ? kRight : 0) |
+                                    (sy <= -kStickDpad / 2 ? kUp : 0) | (sy >= kStickDpad / 2 ? kDown : 0);
+                        }
+                    }
                     pressed |= mine;
                     // The sticks come from the gamepad whose buttons were
                     // pressed last: a two-port adapter shows up as two
@@ -1379,7 +1568,7 @@ namespace pcsx2gs
                     for (int i = 0; i < 4; ++i)
                         *sticks[i] = std::clamp((SDL_GetGamepadAxis(sticksFrom->gamepad, kAxes[i]) + 32768) >> 8, 0, 255);
                 }
-                if (guitarPort && !(sticksFrom && adapterGuitar(*sticksFrom)))
+                if (guitarPort && !(sticksFrom && adapterGuitar(*sticksFrom) && !sticksFrom->dpadOnStick))
                 {
                     // PCSX2's PadGuitar: whammy on the left stick's Y, 0x7f at
                     // rest to 0x00, the rest of the sticks at 0x7f.
@@ -1429,6 +1618,9 @@ namespace pcsx2gs
             std::vector<guitars::Device> m_devices;
             bool m_keysInSong = false;
             bool m_optionsWereOpen = false;
+            bool m_fullscreenAfterOptions = false; // F1 left fullscreen: back to it when the options close
+            SDL_Joystick *m_testPad = nullptr;     // GH1_TEST_ADAPTER's
+            bool m_testPadMade = false;
             uint64_t m_testFlipUntil = 0;
             uint64_t m_lastPadTrace = 0;
             std::array<bool, SDL_SCANCODE_COUNT> m_keyLatched{};
@@ -1436,6 +1628,9 @@ namespace pcsx2gs
             static constexpr uint64_t kStartupFrames = 120; // 2 s: controllers SDL finds at start
             static constexpr uint32_t kAdapterGuitarFrames = 120; // 2 s
             static constexpr uint32_t kAdapterGraceFrames = 60;   // its first second
+            static constexpr uint32_t kAdapterLetGoFrames = 30;   // half a second
+            static constexpr int kStickDpad = 24000;              // a d-pad on the stick: near its end
+            static constexpr uint32_t kRawLines = 300;            // lines a gamepad of what it sends
             bool m_identityKnown = false;
             bool m_guitarPort = true;
             uint64_t m_unplugUntil = 0;
@@ -1472,7 +1667,8 @@ namespace pcsx2gs
             double m_paceSinceMax = 0.0, m_paceEeMax = 0.0, m_paceSince = 0.0, m_paceSince2 = 0.0, m_paceEe = 0.0,
                    m_paceVu = 0.0;
             uint32_t m_paceVuRuns = 0;
-            std::atomic<uint32_t> m_vuSlowRuns{0}, m_vuClears{0};
+            std::atomic<uint32_t> m_vuSlowRuns{0}, m_vuClears{0}, m_vuResets{0};
+            std::atomic<uint64_t> m_vuCompiled{0};
             double m_hitchMs = 25.0;
             bool m_hitchAll = false;
             uint32_t m_hitchLines = 0;
@@ -1536,6 +1732,13 @@ namespace pcsx2gs
                 ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             return v;
         };
+        auto gamepadAs = [&lower](const char *v)
+        {
+            const std::string g = lower(v);
+            return g == "guitar" || g == "guitarra" ? GamepadAs::Guitar
+                   : g == "dualshock"               ? GamepadAs::DualShock
+                                                    : GamepadAs::Auto;
+        };
         // renderer = auto|opengl|d3d11|d3d12|sw (hw is the old name of opengl);
         // the environment's GH1_RENDERER also takes null.
         auto renderer = [&c](const char *r) {
@@ -1557,7 +1760,7 @@ namespace pcsx2gs
         std::string text;
         if (const char *base = SDL_GetBasePath())
         {
-            c.iniPath = std::string(base) + "GH1Recomp.ini";
+            c.iniPath = std::string(base) + GHR_INI;
             std::ifstream f(keyboard::utf8Path(c.iniPath), std::ios::binary);
             std::ostringstream all;
             all << f.rdbuf();
@@ -1590,19 +1793,23 @@ namespace pcsx2gs
                 c.fullscreen = flag(value);
             else if (key == "venue")
                 c.venue = lower(value) != "off" && flag(value);
+            else if (key == "audio_offset")
+                c.audioOffsetMs = std::clamp(std::atoi(value.c_str()), -500, 500);
             else if (key == "vu1_thread")
                 c.vu1Thread = lower(value) == "auto" ? -1 : (lower(value) != "off" && flag(value)) ? 1 : 0;
             else if (key == "priority")
                 c.raisePriority = lower(value) != "normal";
+            else if (key == "gamepad")
+                c.gamepadAs = gamepadAs(value.c_str());
         }
         std::string problems;
         keyboard::read(text, c.keyboard, problems);
         if (!problems.empty())
         {
-            const std::string message = "GH1Recomp.ini: estas teclas nao foram aceitas; essa parte do teclado "
+            const std::string message = GHR_INI ": estas teclas nao foram aceitas; essa parte do teclado "
                                         "fica com as teclas padrao (F1 no jogo para mudar).\n\n" + problems;
             std::fprintf(stderr, "[host] %s", message.c_str());
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "GH1 Recomp", message.c_str(), nullptr);
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, GHR_TITLE, message.c_str(), nullptr);
         }
 
         c.upscale = std::clamp(envFloat("GH1_UPSCALE", c.upscale), 1.0f, 8.0f);
@@ -1614,6 +1821,10 @@ namespace pcsx2gs
             c.fullscreen = envFlag("GH1_FULLSCREEN");
         if (const char *v = std::getenv("GH1_VENUE"))
             c.venue = std::strcmp(v, "off") != 0 && envFlag("GH1_VENUE");
+        if (const char *v = std::getenv("GH1_AUDIO_OFFSET"))
+            c.audioOffsetMs = std::clamp(std::atoi(v), -500, 500);
+        if (const char *g = std::getenv("GH1_GAMEPAD"))
+            c.gamepadAs = gamepadAs(g);
         if (std::getenv("GH1_VU1_THREAD"))
             c.vu1Thread = envFlag("GH1_VU1_THREAD") ? 1 : 0;
         if (const char *p = std::getenv("GH1_PRIORITY"))

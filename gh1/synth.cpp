@@ -25,6 +25,7 @@
 #include "synth/module.h"
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -43,6 +44,8 @@ namespace gh1
         const Addresses *s_addresses = nullptr;
         uint8_t *s_rdram = nullptr;
         gh2::synth::Module s_module;
+        int s_audioOffsetMs = 0;
+        std::atomic<uint64_t> s_framesRendered{0}; // for the trace: where in the output a position was read
         std::vector<gh2::synth::Reply> s_held;
         std::set<uint32_t> s_seenCommands;
 
@@ -69,6 +72,7 @@ namespace gh1
             {
                 s_module.reset();
                 s_module.setSamplesAfterStreamHeap(true);
+                s_module.setStreamShiftMs(s_audioOffsetMs);
             }
 
             [[nodiscard]] ps2x::iop::RpcResult handleRpc(const ps2x::iop::RpcRequest &request) override
@@ -95,7 +99,7 @@ namespace gh1
                     static const bool traceCmds = std::getenv("GH1_TRACE") && std::strstr(std::getenv("GH1_TRACE"), "synthcmd");
                     if (traceCmds && cmd != 409u)
                     {
-                        std::cerr << "[gh1 synthcmd] " << cmd << " len " << len;
+                        std::cerr << "[gh1 synthcmd] @" << s_framesRendered.load(std::memory_order_relaxed) << ' ' << cmd << " len " << len;
                         for (int32_t w = 0; w + 4 <= len && w < 16; w += 4)
                             std::cerr << ' ' << load<int32_t>(s_rdram, data + static_cast<uint32_t>(w));
                         std::cerr << std::endl;
@@ -159,7 +163,8 @@ namespace gh1
             if (trace && (polls++ % 60u == 0u))
             {
                 std::cerr << "[gh1 synth] poll #" << polls << " handler=" << std::hex << handler << std::dec
-                          << " replies";
+                          << " frames=" << s_framesRendered.load(std::memory_order_relaxed) << " starves="
+                          << s_module.starves() << " replies";
                 for (const auto &r : s_held)
                 {
                     std::cerr << ' ' << r.cmd;
@@ -204,15 +209,21 @@ namespace gh1
         void render(float *out, size_t frames)
         {
             s_module.render(out, frames);
+            s_framesRendered.fetch_add(frames, std::memory_order_relaxed);
             mixMovieAudio(out, frames); // the SPU2's sound data input: the movies' sound
         }
     }
 
-    void installSynth(PS2Runtime &runtime, const Addresses &addresses)
+    void installSynth(PS2Runtime &runtime, const Addresses &addresses, int audioOffsetMs)
     {
         s_addresses = &addresses;
         // GH1's IRX puts uploads and samples after the stream heap.
         s_module.setSamplesAfterStreamHeap(true);
+        s_audioOffsetMs = audioOffsetMs;
+        s_module.setStreamShiftMs(audioOffsetMs);
+        if (audioOffsetMs != 0)
+            std::cerr << "[gh1] audio_offset = " << audioOffsetMs << " ms: the songs' audio "
+                      << (audioOffsetMs > 0 ? "later" : "earlier") << " against the notes" << std::endl;
         s_rdram = runtime.memory().getRDRAM();
         runtime.iop().addService(std::make_unique<Synth>());
         gh2::EntryHook<PollTag>::install(runtime, addresses.ctlClientPoll, deliver);

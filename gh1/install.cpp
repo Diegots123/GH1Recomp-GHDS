@@ -32,6 +32,8 @@ namespace
     // venue = off in GH1Recomp.ini (or GH1_VENUE=off): the one extra that
     // changes what the game shows, chosen by the player (see venue.cpp).
     bool s_venue = true;
+    // audio_offset in GH1Recomp.ini (or GH1_AUDIO_OFFSET): audio calibration.
+    int s_audioOffsetMs = 0;
 }
 
 void ps2xConfigureHost(PS2Runtime &runtime)
@@ -39,19 +41,22 @@ void ps2xConfigureHost(PS2Runtime &runtime)
 #if defined(GH1_PCSX2GS)
     const pcsx2gs::HostConfig config = pcsx2gs::hostConfigFromEnvironment();
     s_venue = config.venue;
+    s_audioOffsetMs = config.audioOffsetMs;
     const char *raylib = std::getenv("GH1_RAYLIB");
     if (!raylib || !*raylib || *raylib == '0')
         runtime.setHostFrontend(pcsx2gs::makeSdlHost(config));
 #else
     if (const char *venue = std::getenv("GH1_VENUE"))
         s_venue = std::strcmp(venue, "off") != 0;
+    if (const char *offset = std::getenv("GH1_AUDIO_OFFSET"))
+        s_audioOffsetMs = std::atoi(offset);
 #endif
     gh1::installVu1(runtime);
 }
 
 void ps2xInstallGame(PS2Runtime &runtime)
 {
-    gh1::installSynth(runtime, gh1::kRetail);
+    gh1::installSynth(runtime, gh1::kRetail, s_audioOffsetMs);
     gh1::installPad(runtime, gh1::kRetail);
     gh1::installMovieAudio(runtime);
     gh1::installTraces(runtime);

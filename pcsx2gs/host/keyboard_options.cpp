@@ -1,4 +1,5 @@
 #include "keyboard_options.h"
+#include "product.h"
 
 #include "font8x8.h"
 
@@ -66,7 +67,7 @@ namespace pcsx2gs::keyboard
             close();
             return;
         }
-        m_window = SDL_CreateWindow("GH1 Recomp - Teclado (F1)", kWidth * kScale, kHeight * kScale, 0);
+        m_window = SDL_CreateWindow(GHR_TITLE " - Teclado (F1)", kWidth * kScale, kHeight * kScale, 0);
         if (!m_window)
         {
             std::fprintf(stderr, "[host] options window: %s\n", SDL_GetError());
@@ -137,7 +138,7 @@ namespace pcsx2gs::keyboard
     void OptionsWindow::changed()
     {
         if (!save(m_iniPath, m_config))
-            m_message = "Nao consegui gravar o GH1Recomp.ini";
+            m_message = "Nao consegui gravar o " GHR_INI;
     }
 
     void OptionsWindow::activate()
@@ -306,7 +307,7 @@ namespace pcsx2gs::keyboard
         m_dirty = false;
         const Canvas c{surface};
         SDL_FillSurfaceRect(surface, nullptr, SDL_MapSurfaceRGB(surface, 18, 18, 26));
-        c.text(12, 10, "GH1 Recomp - Teclado", 255, 210, 60);
+        c.text(12, 10, GHR_TITLE " - Teclado", 255, 210, 60);
 
         for (size_t i = 0; i < m_rows.size(); ++i)
         {

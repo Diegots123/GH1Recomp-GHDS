@@ -16,8 +16,8 @@ O executável do jogo é traduzido para C++ e compilado para Windows (ou Linux).
 - Boot, vídeos (com o som da abertura), menus, Quick Play e Career com músicas inteiras, e saves no cartão de memória (`memcards\`).
 - Vídeo pelo GS do PCSX2 em OpenGL ou Direct3D 11 (`renderer` no `GH1Recomp.ini`; resolução interna 3× por padrão, tela cheia com F11 ou Alt+Enter); VU1 pelo microVU do PCSX2, numa thread própria a partir de 2 threads de CPU.
 - Os reflexos de luz do palco, lidos do Z buffer um ou dois quadros depois (imperceptível), sem o jogo esperar a placa de vídeo.
-- Extras: as duas músicas completas que o disco tem e nenhuma lista mostra (Graveyard Shift e Trippolette) no fim do Quick Play, e `venue = off` para placas fracas (só a pista, sem o palco).
-- Controles: guitarras atuais (Xbox 360, PS3, Wii por raphnet, Rock Band 4, Riffmaster, World Tour de PC), guitarra e DualShock 2 de PS2 por adaptador USB, e teclado (configurado com F1 no menu principal).
+- Extras: as duas músicas completas que o disco tem e nenhuma lista mostra (Graveyard Shift e Trippolette) no fim do Quick Play, `audio_offset`, a calibração de áudio que o jogo não tem no menu (o som das músicas mais cedo ou mais tarde em relação às notas, sem mexer no disco), e `venue = off` para placas fracas (só a pista, sem o palco).
+- Controles: guitarras atuais (Xbox 360, PS3, Wii por raphnet, Rock Band 4, Riffmaster, World Tour de PC), guitarra e DualShock 2 de PS2 por adaptador USB (inclusive o Twin USB, que manda a guitarra no modo digital: tudo funciona menos o whammy; `gamepad = guitar|dualshock` no ini decide se o reconhecimento automático errar), e teclado (configurado com F1 no menu principal; no modo palhetando, as teclas dos trastes valem nos menus, para os cheats do menu principal).
 - Só abre com a imagem idêntica à do Redump: nada modificado.
 
 Controles e configurações em detalhe: [`dist/windows/LEIA-ME.txt`](dist/windows/LEIA-ME.txt). Notas de desenvolvimento: [`GH1_PROGRESS.md`](GH1_PROGRESS.md).
@@ -100,7 +100,7 @@ Este projeto é distribuído sob a **GPL-3.0** ([`LICENSE`](LICENSE)). O zip ger
 
 ## English
 
-A native PC recompilation of **Guitar Hero (PS2, USA, SLUS-21224, v1.00)**, built from **your own disc**. The game's executable is translated to C++ and compiled for Windows (or Linux). It runs GH1's own engine with no mods: the PS2's gameplay and timing, with faster loads, higher resolution and modern guitars. Two extras: the disc's two hidden songs (Graveyard Shift, Trippolette) at the end of Quick Play, and `venue = off` (opt-in) for weak GPUs. OpenGL or Direct3D 11; the VU1 runs on its own thread.
+A native PC recompilation of **Guitar Hero (PS2, USA, SLUS-21224, v1.00)**, built from **your own disc**. The game's executable is translated to C++ and compiled for Windows (or Linux). It runs GH1's own engine with no mods: the PS2's gameplay and timing, with faster loads, higher resolution and modern guitars. Extras: the disc's two hidden songs (Graveyard Shift, Trippolette) at the end of Quick Play, and two opt-in ones: `audio_offset`, the audio calibration the game's menu lacks (the songs' audio earlier or later against the notes, with the disc untouched), and `venue = off` for weak GPUs. Controls: modern guitars, PS2 guitars and DualShock 2s on USB adapters (Twin USB included, without the whammy it cannot pass), and the keyboard, whose fret keys also work in the menus for the cheats. OpenGL or Direct3D 11; the VU1 runs on its own thread.
 
 > **This repository contains nothing from the game**: no executable, audio, video, textures or recompiled code, and the Releases carry no exe. Everyone builds the game from their own disc image (Redump, Guitar Hero (USA) v1.00). The resulting exe holds code translated from your disc: **it is for you only; do not distribute it.** Unofficial; not affiliated with Harmonix, RedOctane or Activision.
 

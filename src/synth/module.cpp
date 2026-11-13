@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <numbers>
@@ -143,6 +144,10 @@ namespace gh2::synth
         std::deque<uint8_t> iop;
         bool endOfData = false;
         uint32_t padded = 0;
+        // setStreamShiftMs: silent lines still to play before the data, or
+        // bytes of the data's start still to leave out.
+        uint32_t leadIn = 0;
+        uint32_t skip = 0;
 
         uint32_t base = 0;   // sound RAM ring
         uint32_t blocks = 0;
@@ -404,6 +409,16 @@ namespace gh2::synth
                 ch.index = c;
                 ch.rate = u32(d, 8u + c * 4u);
                 ch.slip = d[0x44u + c] != 0u;
+                if (m_streamShiftMs != 0)
+                {
+                    // Whole ADPCM lines (28 samples), each channel at its rate.
+                    const uint64_t ms = static_cast<uint64_t>(std::abs(static_cast<int64_t>(m_streamShiftMs)));
+                    const uint32_t lines = static_cast<uint32_t>((ms * ch.rate + 14000u) / 28000u);
+                    if (m_streamShiftMs > 0)
+                        ch.leadIn = lines;
+                    else
+                        ch.skip = lines * kAdpcmBlockBytes;
+                }
                 // Two blocks, or with slip enough for the window either way
                 // plus four (0x2d34).
                 ch.blocks = 2u;
@@ -523,6 +538,11 @@ namespace gh2::synth
                     if (b & 0x80u)
                         ch.endOfData = true;
                     b = kAdpcmRepeat;
+                }
+                if (ch.skip != 0u)
+                {
+                    --ch.skip; // a shift earlier: the start of the data is left out
+                    continue;
                 }
                 ch.iop.push_back(b);
             }
@@ -776,12 +796,17 @@ namespace gh2::synth
     void Module::transfer(Channel &ch)
     {
         uint8_t block[kBlockBytes];
-        const uint32_t take = std::min<uint32_t>(kBlockBytes, static_cast<uint32_t>(ch.iop.size()));
-        std::copy_n(ch.iop.begin(), take, block);
+        // A shift later: silent lines first, the data behind them.
+        uint32_t at = 0;
+        for (; ch.leadIn != 0u && at < kBlockBytes; at += kAdpcmBlockBytes, --ch.leadIn)
+            for (uint32_t off = 0; off < kAdpcmBlockBytes; ++off)
+                block[at + off] = off == 1u ? kAdpcmRepeat : 0u;
+        const uint32_t take = std::min<uint32_t>(kBlockBytes - at, static_cast<uint32_t>(ch.iop.size()));
+        std::copy_n(ch.iop.begin(), take, block + at);
         ch.iop.erase(ch.iop.begin(), ch.iop.begin() + take);
-        if (take < kBlockBytes)
+        if (at + take < kBlockBytes)
         {
-            for (uint32_t off = take; off < kBlockBytes; ++off)
+            for (uint32_t off = at + take; off < kBlockBytes; ++off)
                 block[off] = off % kAdpcmBlockBytes == 1u ? kAdpcmRepeat : 0u;
             ++ch.padded;
         }
@@ -839,6 +864,7 @@ namespace gh2::synth
     void Module::starveChannel(Channel &ch)
     {
         ch.state = kStarved;
+        ++m_starves;
         if (ch.main >= 0)
             m_spu.setPitch(static_cast<uint32_t>(ch.main), 0u);
         if (ch.reference >= 0)

@@ -60,10 +60,24 @@ namespace ps2x::vif1
                 {
                     std::fprintf(stderr, "[vif1] %s\n", e.what());
                 }
-                s_busyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                             std::chrono::steady_clock::now() - t0)
-                                                             .count()),
+                const auto took = std::chrono::steady_clock::now() - t0;
+                s_busyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(took).count()),
                                    std::memory_order_relaxed);
+                // A job that held the picture up (the VU1 programs in it log
+                // their own part, see the host's VU1 backend).
+                static unsigned slowLines = 0;
+                if (took > std::chrono::milliseconds(100) && slowLines < 100)
+                {
+                    ++slowLines;
+                    size_t queued;
+                    {
+                        std::lock_guard lock(s_mutex);
+                        queued = s_queue.size();
+                    }
+                    std::fprintf(stderr, "[vif1] a job took %.1f ms (%s, %zu bytes; %zu queued behind it)\n",
+                                 std::chrono::duration<double, std::milli>(took).count(),
+                                 job.data.empty() ? "a call" : "VIF1 data", job.data.size(), queued);
+                }
                 {
                     std::lock_guard lock(s_mutex);
                     ++s_finished;

@@ -156,7 +156,15 @@ target_include_directories(pcsx2vu PRIVATE ${P}/pcsx2/x86)
 # EmuConfig, g_cpu and the executable memory come with the GS library.
 target_link_libraries(pcsx2vu PUBLIC pcsx2gs pcsx2_common)
 
-add_library(pcsx2vu_bridge STATIC ${CMAKE_CURRENT_SOURCE_DIR}/bridge/pcsx2vu_bridge.cpp)
+add_library(pcsx2vu_bridge STATIC ${CMAKE_CURRENT_SOURCE_DIR}/bridge/pcsx2vu_bridge.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bridge/stall_probe.cpp)
+# Where a stalled thread was (Windows: the thread suspended, its context and
+# stack read). Off in releases: antivirus heuristics flag unsigned exes that
+# read other threads' contexts.
+option(GHR_STALL_SAMPLES "stall_probe: sample where a stalled thread is" OFF)
+if(GHR_STALL_SAMPLES)
+    target_compile_definitions(pcsx2vu_bridge PRIVATE GHR_STALL_SAMPLES=1)
+endif()
 target_link_libraries(pcsx2vu_bridge PRIVATE pcsx2vu)
 target_include_directories(pcsx2vu_bridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bridge)
 

@@ -16,7 +16,8 @@ namespace pcsx2vu
     {
         // PCSX2's FPRoundMode for VU1 arithmetic: 0 nearest, 1 toward -inf,
         // 2 toward +inf, 3 toward zero (PCSX2's default). Its game database
-        // sets 1 for Guitar Hero (SLUS-21224).
+        // sets 1 for Guitar Hero (SLUS-21224) and 0 for Guitar Hero II
+        // (SLUS-21447).
         int roundMode = 3;
     };
 
@@ -59,6 +60,8 @@ namespace pcsx2vu
         uint64_t longestNs = 0;
         uint32_t slowRuns = 0; // programs that took over a millisecond: microVU compiling new code, mostly
         uint32_t clears = 0;   // new microcode uploaded since the last run (microVU looks the program up again)
+        uint64_t compiledBytes = 0; // x86 code microVU compiled
+        uint32_t cacheResets = 0;   // times microVU's code cache filled up and started over
     };
     Timing takeTiming();
 }
